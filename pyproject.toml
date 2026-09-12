@@ -27,7 +27,30 @@ Paper = "https://arxiv.org/abs/1802.08219"
 packages = ["src/tfn"]
 
 [dependency-groups]
-dev = ["pytest>=8"]
+# 只在本機開發時用。Colab 那端以 --no-deps 安裝，完全不會碰到這組。
+dev = [
+    "pytest>=8",
+    "ruff>=0.14",
+    "pyright>=1.1.400",
+]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+# reference/ 是上游原碼，唯讀對照用，不歸我們管
+extend-exclude = ["reference"]
+
+[tool.ruff.lint]
+# E/W 排版, F 實質問題, I import 排序, UP 過時寫法, B 常見 bug 模式
+select = ["E", "W", "F", "I", "UP", "B"]
+
+[tool.pyright]
+include = ["src", "tests"]
+# basic 而非 strict：torch 的型別標註不完整，strict 會對合法程式碼吠很多
+typeCheckingMode = "basic"
+# 用 requires-python 的下限檢查，這樣不小心用到 3.11+ 語法會被擋
+pythonVersion = "3.10"
+venvPath = "."
+venv = ".venv"

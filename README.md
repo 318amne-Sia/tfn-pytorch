@@ -43,9 +43,19 @@ Colab 的 pip 安裝不持久，換一台 VM 就沒了，所以這格每個 sess
 所以寫程式和跑測試都在本機做，Colab 只用來驗收整條管線。
 
 ```sh
-uv sync          # 建 Python 3.12 環境（對齊 Colab 的 3.12.13）並安裝
-uv run pytest    # 跑測試
+uv sync                # 建 Python 3.12 環境（對齊 Colab 的 3.12.13）並安裝
+uv run pytest          # 測試
+uv run ruff check .    # lint
+uv run ruff format .   # 格式化
+uv run pyright         # 型別檢查
 ```
+
+`ruff` 與 `pyright` 只在本機開發時用，不是執行期依賴，
+所以 Colab 那端的 `--no-deps` 安裝完全不受影響。
+
+它們抓的是**機械性翻譯錯誤**（API 簽名不合、殘留 import、`is` 比較字面值），
+不是數學錯誤——einsum 索引排錯或 CG 符號弄反，靜態工具一律看不見，
+那是 `tests/` 裡等變性測試的職責。
 
 套件採 src layout：程式碼在 `src/tfn/`，不在 repo 根目錄。
 這逼得本機測試 import 到的一定是「安裝後」的那一份，跟 Colab 上的情況一致，
