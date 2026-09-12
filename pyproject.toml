@@ -1,0 +1,33 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "tfn"
+version = "0.1.0"
+description = "Tensor Field Networks (Thomas et al. 2018) 的 PyTorch 移植"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+license-files = ["LICENSE"]
+dependencies = [
+    "torch>=2.0",
+    "numpy>=1.24",
+    "scipy>=1.10",
+]
+
+[project.urls]
+Homepage = "https://github.com/318amne-Sia/tfn-pytorch"
+Upstream = "https://github.com/tensorfieldnetworks/tensorfieldnetworks"
+Paper = "https://arxiv.org/abs/1802.08219"
+
+# src layout：套件不在 repo 根目錄，所以本機跑測試時 import 到的
+# 一定是「安裝後」的那一份，跟 Colab 上的情況一致。
+[tool.hatch.build.targets.wheel]
+packages = ["src/tfn"]
+
+[dependency-groups]
+dev = ["pytest>=8"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

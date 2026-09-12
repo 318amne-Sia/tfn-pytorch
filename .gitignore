@@ -1,0 +1,21 @@
+# 工作區：票、暫存、實驗輸出
+.scratch/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+.ipynb_checkpoints/
+
+# macOS
+.DS_Store
+
+# 論文 PDF 不轉散布，README 放 arXiv 連結即可
+paper/
+
+# 從 PDF 抽出的文字（2.8MB，且是 paper/ 的衍生物）
+reference/paper_text.txt

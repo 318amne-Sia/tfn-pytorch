@@ -1,0 +1,72 @@
+# tfn-pytorch
+
+[Tensor Field Networks](https://arxiv.org/abs/1802.08219) (Thomas et al., 2018) 的 PyTorch 移植，
+用來一個一個復現論文的三個實驗。
+
+上游原作是 TensorFlow 1.x（graph mode、Python 2），現在已經跑不起來：
+TF 1.15 最高只支援 Python 3.7，macOS arm64 根本沒有 wheel，Colab 也早就拔掉了 `%tensorflow_version 1.x`。
+
+## 進度
+
+| 實驗 | 論文章節 | 狀態 |
+| --- | --- | --- |
+| shape classification（3D Tetris） | §5.1 | 進行中 |
+| moment of inertia | §5.2 | 未開始 |
+| missing point（QM9） | §5.3 | 未開始 |
+
+## 在 Colab 上用
+
+Colab runtime 看不到你本機的檔案，所以套件必須從 GitHub 抓。把這格放在 notebook 第一格：
+
+```python
+%pip install -q --force-reinstall --no-deps \
+    git+https://github.com/318amne-Sia/tfn-pytorch.git@main
+
+import tfn
+print(tfn.__version__)
+```
+
+兩個旗標都不是可有可無的：
+
+- **`--no-deps`** —— Colab 已經預裝 torch / numpy / scipy，而且那個 torch 是對著它自己的 CUDA 編的。
+  少了這個旗標，pip 會看到我們宣告的 `torch>=2.0` 而跑去 PyPI 重裝一份通用版：
+  下載近 1 GB、花好幾分鐘，還可能把 GPU 弄丟。
+- **`--force-reinstall`** —— 版本號沒變時 pip 會直接跳過安裝。推了修正之後想抓到新版就得靠它。
+
+重裝之後舊模組還在 `sys.modules` 裡，**要重啟 kernel** 才吃得到新版。
+
+Colab 的 pip 安裝不持久，換一台 VM 就沒了，所以這格每個 session 都要跑一次。
+
+## 在本機開發
+
+實驗一（N=4、batch=1）在 CPU 上幾分鐘就跑完，丟 GPU 只會被 kernel launch 開銷拖慢，
+所以寫程式和跑測試都在本機做，Colab 只用來驗收整條管線。
+
+```sh
+uv sync          # 建 Python 3.12 環境（對齊 Colab 的 3.12.13）並安裝
+uv run pytest    # 跑測試
+```
+
+套件採 src layout：程式碼在 `src/tfn/`，不在 repo 根目錄。
+這逼得本機測試 import 到的一定是「安裝後」的那一份，跟 Colab 上的情況一致，
+避免「本機跑得動、`pip install` 之後壞掉」。
+
+## 目錄
+
+| 路徑 | 內容 |
+| --- | --- |
+| `src/tfn/` | 移植後的套件 |
+| `tests/` | 測試。核心是等變性測試：旋轉輸入後 L=0 輸出不變、L=1 輸出跟著轉 |
+| `notebooks/` | 各實驗的 notebook |
+| `reference/` | 作者原始 TF1 實作，**唯讀對照用，不要改** |
+
+## reference/ 是什麼
+
+`reference/tensorfieldnetworks-tf/` 是[作者原始 repo](https://github.com/tensorfieldnetworks/tensorfieldnetworks) 的副本
+（commit `6850fd6`, 2020-01-07, MIT）。移植時逐行對照用，出處與 commit 記在 `reference/README.md`。
+
+論文 PDF 不進 repo（見 `.gitignore`），從 [arXiv](https://arxiv.org/abs/1802.08219) 取得。
+
+## 授權
+
+MIT，沿用上游。見 `LICENSE`。
