@@ -135,7 +135,11 @@ class ShapeClassifier(nn.Module):
             distance_matrix(geometry), low=self.rbf_low, high=self.rbf_high, count=self.rbf_count
         )
 
-        ones = torch.ones(geometry.shape[0], 1, 1, device=geometry.device, dtype=geometry.dtype)
+        # 常數輸入跟著**參數**的 device / dtype，不是跟著 geometry：模型與輸入
+        # dtype 不合時，錯誤要出在 geometry 進來的地方，而不是被這個張量掩護到
+        # 更裡面才炸
+        weight = self.embed.linear.weight
+        ones = torch.ones(geometry.shape[0], 1, 1, device=weight.device, dtype=weight.dtype)
         features: Features = {0: [self.embed(ones)]}
         for block in self.blocks:
             features = block(features, rbf, rij)
@@ -180,6 +184,8 @@ class Evaluation(NamedTuple):
 
     def accuracy_for(self, name: str) -> float:
         guesses = self.predictions[name]
+        if not guesses:
+            raise ValueError(f"{name} 沒有任何預測，算不出準確率")
         return sum(guess == name for guess in guesses) / len(guesses)
 
 
@@ -197,6 +203,11 @@ def evaluate(
     每一輪替每個形狀抽一組新的姿態，所以 ``rounds`` 輪 × 8 個形狀 =
     ``8 * rounds`` 個樣本。傳 int 或 Generator 給 ``rng`` 就可重現。
     """
+    if len(shapes) != len(names):
+        raise ValueError(f"shapes 與 names 數量不符：{len(shapes)} 個形狀、{len(names)} 個名字")
+    if rounds < 1:
+        raise ValueError(f"rounds 至少要 1，收到 {rounds}")
+
     generator = np.random.default_rng(rng)
     predictions: dict[str, list[str]] = {name: [] for name in names}
     correct = 0

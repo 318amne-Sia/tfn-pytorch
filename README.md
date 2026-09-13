@@ -45,7 +45,7 @@ Colab 的 pip 安裝不持久，換一台 VM 就沒了，所以這格每個 sess
 ```sh
 uv sync                        # 建 Python 3.12 環境（對齊 Colab 的 3.12.13）並安裝
 uv run pytest                  # 測試
-uv run pytest -m "not slow"    # 跳過需要實際訓練的那兩條（省約 8 秒）
+uv run pytest -m "not slow"    # 跳過訓練到收斂的那兩條（12 秒 -> 2 秒）
 uv run ruff check .            # lint
 uv run ruff format .           # 格式化
 uv run pyright                 # 型別檢查

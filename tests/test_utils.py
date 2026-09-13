@@ -216,23 +216,26 @@ def test_rbf_expansion_peaks_at_its_centres():
         assert row.argmax().item() == i
 
 
-def test_rbf_expansion_matches_the_upstream_formula():
-    """上游寫成 exp(-gamma · (d - c)²)，gamma = 1 / 中心間距。"""
-    low, high, count = 0.0, 3.5, 4
-    d = utils.distance_matrix(torch.randn(4, 3))
-    gamma = 1.0 / ((high - low) / count)
-    expected = torch.exp(-gamma * (d.unsqueeze(-1) - torch.linspace(low, high, count)) ** 2)
-    assert torch.allclose(utils.rbf_expansion(d, low=low, high=high, count=count), expected)
+def test_rbf_expansion_pins_both_upstream_conventions():
+    """對著手寫的常數釘死，而不是把實作的式子再抄一遍。
+
+    兩個會弄錯的地方，這裡各寫成字面值：
+
+    - 中心含兩端（``linspace(low, high, count)``），(0, 3.5, 4) 就是
+      ``[0, 7/6, 7/3, 3.5]``，不是 ``[0, 0.875, 1.75, 2.625]``
+    - 寬度的分母是 ``count`` 而不是 ``count - 1``，gamma = 1 / 0.875
+    """
+    got = utils.rbf_expansion(torch.tensor([1.0]), low=0.0, high=3.5, count=4)[0]
+    expected = [math.exp(-((1.0 - centre) ** 2) / 0.875) for centre in (0.0, 7 / 6, 7 / 3, 3.5)]
+    assert got.tolist() == pytest.approx(expected, rel=1e-6)
 
 
-def test_rbf_expansion_is_invariant_to_rigid_motion():
-    """它只吃距離，所以旋轉與平移都看不見——票 03 以後的等變性測試靠這點。"""
-    points = torch.randn(5, 3)
-    moved = points @ utils.random_rotation_matrix(0).T + torch.tensor([1.5, -2.0, 0.7])
-    kwargs = {"low": 0.0, "high": 3.5, "count": 4}
-    before = utils.rbf_expansion(utils.distance_matrix(points), **kwargs)
-    after = utils.rbf_expansion(utils.distance_matrix(moved), **kwargs)
-    assert torch.allclose(after, before, atol=1e-5)
+def test_rbf_expansion_promotes_integer_distances():
+    """整數距離不能讓中心被截成 [0, 1, 2, 3]——那會算出位置錯掉的響應。"""
+    integer = utils.rbf_expansion(torch.arange(3), low=0.0, high=3.5, count=4)
+    float_ = utils.rbf_expansion(torch.arange(3).float(), low=0.0, high=3.5, count=4)
+    assert integer.dtype.is_floating_point
+    assert torch.allclose(integer, float_)
 
 
 @pytest.mark.parametrize("device", DEVICES)

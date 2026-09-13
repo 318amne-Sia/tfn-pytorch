@@ -96,10 +96,18 @@ def rbf_expansion(distances: Tensor, *, low: float, high: float, count: int) -> 
     中心上的高斯響應，再餵進 MLP（:class:`~tfn.layers.R`）。直接把純量距離
     餵進 MLP 學不動——展開之後每個中心各自負責一段距離區間，網路才有東西可分。
 
-    高斯的寬度取中心間距（``gamma = 1 / spacing``），與上游 notebook 相同。
+    寬度照抄上游 notebook 的 ``gamma = 1 / ((high - low) / count)``。注意這個
+    ``spacing`` **不是中心的實際間距**：``linspace(low, high, count)`` 含兩端，
+    相鄰中心差的是 ``(high - low) / (count - 1)``。以實驗一的 (0, 3.5, 4) 來說
+    是 0.875 對 1.1667——高斯比中心間距窄。上游就是這樣寫的，這裡照留，但
+    調 ``count`` 時要知道寬度不會跟著中心走。
+
+    中心的 dtype 不直接沿用 ``distances``：整數距離會讓 linspace 把中心截成
+    ``[0, 1, 2, 3]``，算出來是一組看起來正常、位置卻錯掉的響應。
     """
     spacing = (high - low) / count
-    centers = torch.linspace(low, high, count, device=distances.device, dtype=distances.dtype)
+    dtype = torch.promote_types(distances.dtype, torch.get_default_dtype())
+    centers = torch.linspace(low, high, count, device=distances.device, dtype=dtype)
     return torch.exp(-((distances.unsqueeze(-1) - centers) ** 2) / spacing)
 
 

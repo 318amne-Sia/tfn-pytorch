@@ -15,7 +15,9 @@ from torch.nn import functional as F
 
 from tfn import layers, utils
 
-# 與上游 notebook 第 3 格相同的 RBF 設定（票 07 的實驗值）。
+# 這裡只需要「某一組」RBF 設定；沿用實驗一的值純粹是方便跟 reference 對照。
+# 刻意不從 tfn.shape_classification import——濾波器的測試不該綁在某個實驗上，
+# 這幾個數字改掉也不會影響本檔任何一條斷言的意義。
 RBF_LOW = 0.0
 RBF_HIGH = 3.5
 RBF_COUNT = 4

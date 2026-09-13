@@ -55,8 +55,9 @@ class R(nn.Module):
 
     ``[N, N, input_dim] -> [N, N, output_dim]``
 
-    論文 §5 說這一段與 SchNet 相同：距離先展開成高斯基底（呼叫端負責，見
-    票 07 的 notebook），再過 MLP。這裡不做展開，只吃展開後的結果。
+    論文 §5 說這一段與 SchNet 相同：距離先展開成高斯基底
+    （:func:`~tfn.utils.rbf_expansion`，由呼叫端負責），再過 MLP。
+    這裡不做展開，只吃展開後的結果。
     """
 
     def __init__(

@@ -26,9 +26,11 @@ from tfn.shape_classification import (
     train,
 )
 
-# 論文宣稱的 perfect accuracy 需要這麼多 epoch：實測 5 個 seed 在 600 epochs
-# 全部到 100%，400 會漏掉其中一個。
-EPOCHS_TO_CONVERGE = 600
+# 論文宣稱的 perfect accuracy 需要這麼多 epoch：實測 5 個 seed 在 600 就全部
+# 到 100%，400 會漏掉其中一個。這裡取 1000（與 notebook 一致）而不是貼著
+# 600：這條斷言是 `== 1.0`，torch 版本、BLAS 或 CPU 的求和順序一變，從
+# seed 0 出發的軌跡就會不同，餘裕留在關卡上比留在 notebook 上重要。多花約 4 秒。
+EPOCHS_TO_CONVERGE = 1000
 
 
 # --------------------------------------------------------------------------
@@ -112,12 +114,21 @@ def test_model_stacks_three_layers_and_reads_out_scalars():
 
 
 def test_model_registers_every_submodule():
-    """embed、三層、readout 的參數都要被 optimizer 看得到。"""
+    """參數張量數要等於照架構獨立算出來的數字。
+
+    走訪 model.embed / model.blocks / model.readout 再加總是問不出東西的——
+    那跟 model.parameters() 走的是同一批子節點，Layer 內部漏註冊的話兩邊
+    會一起漏。所以這裡列出獨立的帳：
+
+      embed  SelfInteraction(1 -> 1, 無 bias)                          =  1
+      層 1   輸入 {0:[1]}：2 條路徑 × R(w1,b1,w2,b2) = 8
+             SI: L=0 有 bias 2 + L=1 無 bias 1 = 3；Nonlin: 0 + 1 = 1  = 12
+      層 2   輸入 {0:[4],1:[4]}：5 條路徑 × 4 = 20，SI 3，Nonlin 1      = 24
+      層 3   同上                                                       = 24
+      readout  nn.Linear(4 -> 8) 的 weight 與 bias                      =  2
+    """
     model = ShapeClassifier(len(TETRIS))
-    by_hand = len(list(model.embed.parameters())) + len(list(model.readout.parameters()))
-    for block in model.blocks:
-        by_hand += len(list(block.parameters()))
-    assert len(list(model.parameters())) == by_hand
+    assert len(list(model.parameters())) == 1 + 12 + 24 + 24 + 2
 
 
 def test_untrained_model_is_invariant_to_pose():
@@ -125,12 +136,29 @@ def test_untrained_model_is_invariant_to_pose():
 
     整條鏈（票 02 到 06）如果有任何一環的等變性是假的，這裡就會露餡，
     而且不必等到訓練完。
+
+    兩件事決定這條測試抓不抓得到東西：
+
+    - ``rng`` 要在迴圈**外**建，讓 8 個形狀各拿到不同姿態。建在迴圈裡的話
+      每個形狀都套同一個旋轉，只驗到單一角度，破壞量會被壓低一個量級。
+    - 容忍度 1e-6。正確的模型偏差是 1.3e-7，所以還有 10 倍餘裕；而給三個
+      L=1 的 SelfInteraction 各加一個 1e-3 的 bias（票 05 說會破壞等變性、
+      且不會報錯也不會讓 loss 變難看）會產生 1.4e-4 的偏差。1e-5 配上
+      迴圈內的 rng 會讓那個變異溜過去。
     """
     torch.manual_seed(0)
     model = ShapeClassifier(len(TETRIS))
+    rng = np.random.default_rng(1)
     for shape in tetris_shapes():
-        posed = random_pose(shape, np.random.default_rng(1))
-        assert torch.allclose(model(posed), model(shape), atol=1e-5)
+        assert torch.allclose(model(random_pose(shape, rng)), model(shape), atol=1e-6)
+
+
+def test_model_follows_the_parameter_dtype():
+    """模型與輸入都轉成 float64 時要算得出來，而不是在某個 nn.Linear 裡才炸。"""
+    model = ShapeClassifier(len(TETRIS)).double()
+    output = model(tetris_shapes(dtype=torch.float64)[0])
+    assert output.dtype == torch.float64
+    assert output.shape == (len(TETRIS),)
 
 
 def test_untrained_model_separates_the_chiral_pair():
