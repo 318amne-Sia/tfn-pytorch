@@ -7,6 +7,7 @@
 """
 
 import math
+from typing import cast
 
 import pytest
 import torch
@@ -619,3 +620,224 @@ def test_nonlinearity_is_translation_invariant_through_a_filter():
     after = nl(apply_path(path, x, points + shift))
 
     assert torch.allclose(after, before, atol=1e-5)
+
+
+# --------------------------------------------------------------------------
+# Convolution 與 concatenation：完整一層
+# --------------------------------------------------------------------------
+
+
+def scalar_input(channels: int = 1) -> dict[int, list[torch.Tensor]]:
+    """網路的起點：每個點一組全 1 的 L=0 特徵（同上游 notebook 的 embed 前身）。"""
+    return {0: [torch.ones(POINTS, channels, 1)]}
+
+
+def count_parameters_by_hand(layer: layers.Layer) -> int:
+    """繞過 nn.Module 的註冊機制，照結構把子模組的參數逐一數一遍。
+
+    子模組若被塞進普通 list / dict 而不是 ModuleList / ModuleDict，
+    layer.parameters() 就看不到它們，但這裡照樣數得到——兩邊對不起來
+    就是註冊漏了。
+    """
+    leaves = list(layer.convolution.paths)
+    for step in (layer.self_interaction, layer.nonlinearity):
+        for module_list in step.layers.values():
+            # ModuleDict.values() 的靜態型別只到 Module，實際上是 ModuleList
+            leaves.extend(cast(torch.nn.ModuleList, module_list))
+    return sum(len(list(leaf.parameters())) for leaf in leaves)
+
+
+# --- 通道帳 ---------------------------------------------------------------
+
+
+def test_convolution_channel_bookkeeping_from_a_single_scalar():
+    """{0:[1]} 進去，出來是 {0:[1], 1:[1]}——L=0 走 filter_0 與 filter_1_output_1。"""
+    conv = layers.Convolution({0: [1]}, RBF_COUNT)
+    assert conv.output_channels == {0: [1], 1: [1]}
+
+
+def test_convolution_channel_bookkeeping_from_mixed_L():
+    """{0:[4], 1:[4]} 進去，出來是 {0:[4,4], 1:[4,4,4]}——五條路徑。
+
+    順序照 reference 的走訪：先 L=0（filter_0 → L=0、filter_1_output_1 → L=1），
+    再 L=1（filter_0 → L=1、filter_1_output_0 → L=0、filter_1_output_1 → L=1）。
+    """
+    conv = layers.Convolution({0: [4], 1: [4]}, RBF_COUNT)
+    assert conv.output_channels == {0: [4, 4], 1: [4, 4, 4]}
+
+
+def test_concatenated_channel_bookkeeping():
+    """沿通道軸串接，一個 L 只剩一條張量。"""
+    assert layers.concatenated_channels({0: [4, 4], 1: [4, 4, 4]}) == {0: [8], 1: [12]}
+
+
+def test_convolution_rejects_angular_momenta_it_cannot_build():
+    conv_input = {0: [4], 2: [4]}
+    with pytest.raises(NotImplementedError):
+        layers.Convolution(conv_input, RBF_COUNT)
+
+
+# --- 中間狀態的型別與可分步呼叫 -------------------------------------------
+
+
+def test_convolution_output_matches_its_own_bookkeeping():
+    """通道帳是建構時算的，要真的等於 forward 出來的形狀。"""
+    conv = layers.Convolution({0: [4], 1: [4]}, RBF_COUNT)
+    points = geometry(POINTS)
+    x = {0: [features(0, channels=4)], 1: [features(1, channels=4)]}
+
+    out = conv(x, rbf_expansion(points), utils.difference_matrix(points))
+
+    for angular_momentum, channel_counts in conv.output_channels.items():
+        assert [t.shape[-2] for t in out[angular_momentum]] == channel_counts
+        for t in out[angular_momentum]:
+            assert t.shape == (POINTS, t.shape[-2], 2 * angular_momentum + 1)
+
+
+def test_intermediate_state_is_a_dict_of_lists_of_tensors():
+    layer = layers.Layer({0: [1]}, RBF_COUNT, output_dim=4)
+    points = geometry(POINTS)
+    rbf, rij = rbf_expansion(points), utils.difference_matrix(points)
+
+    after_convolution = layer.convolution(scalar_input(), rbf, rij)
+    after_concatenation = layers.concatenation(after_convolution)
+
+    for state in (after_convolution, after_concatenation):
+        assert isinstance(state, dict)
+        assert all(isinstance(key, int) for key in state)
+        assert all(isinstance(value, list) for value in state.values())
+        assert all(isinstance(t, torch.Tensor) for value in state.values() for t in value)
+
+
+def test_the_four_steps_compose_into_the_whole_layer():
+    """四個步驟各自可單獨呼叫，串起來就等於 Layer。"""
+    layer = layers.Layer({0: [1]}, RBF_COUNT, output_dim=4)
+    points = geometry(POINTS)
+    rbf, rij = rbf_expansion(points), utils.difference_matrix(points)
+    x = scalar_input()
+
+    stepwise = layer.nonlinearity(
+        layer.self_interaction(layers.concatenation(layer.convolution(x, rbf, rij)))
+    )
+    whole = layer(x, rbf, rij)
+
+    assert stepwise.keys() == whole.keys()
+    for angular_momentum in whole:
+        for got, expected in zip(stepwise[angular_momentum], whole[angular_momentum], strict=True):
+            assert torch.equal(got, expected)
+
+
+def test_concatenation_leaves_one_tensor_per_L():
+    conv = layers.Convolution({0: [4], 1: [4]}, RBF_COUNT)
+    points = geometry(POINTS)
+    x = {0: [features(0, channels=4)], 1: [features(1, channels=4)]}
+
+    out = layers.concatenation(conv(x, rbf_expansion(points), utils.difference_matrix(points)))
+
+    assert [t.shape[-2] for t in out[0]] == [8]
+    assert [t.shape[-2] for t in out[1]] == [12]
+
+
+def test_self_interaction_step_uses_bias_only_for_scalars():
+    """L=0 有 bias、L>0 沒有——票 05 的規則要在這一層真的被套用。"""
+    step = layers.SelfInteractionStep({0: [8], 1: [12]}, output_dim=4)
+    # 有 bias 的版本掛 weight + bias 兩顆參數，無 bias 的只有 weight
+    assert len(list(step.layers["0"].parameters())) == 2
+    assert len(list(step.layers["1"].parameters())) == 1
+
+
+# --- 參數註冊 -------------------------------------------------------------
+
+
+def test_every_submodule_is_registered():
+    """子模組放進普通 list 或 dict，optimizer 就看不到它們。
+
+    訓練照跑、loss 也會降，但那些層永遠不學——這是 nn.Module 重構最典型的坑。
+    """
+    layer = layers.Layer({0: [1]}, RBF_COUNT, output_dim=4)
+    assert len(list(layer.parameters())) == count_parameters_by_hand(layer)
+
+
+def test_parameter_count_matches_an_explicit_tally():
+    """獨立於上一條的絕對數字，防止兩邊一起漏或一起重複數。
+
+    {0:[1]} 起手、rbf_count=4、output_dim=4：
+      Convolution 兩條路徑（filter_0、filter_1_output_1），各一個 R
+        = 2 條 × (w1, b1, w2, b2) = 8
+      SelfInteraction L=0 有 bias（w, b）+ L=1 無 bias（w）    = 3
+      Nonlinearity   L=0 無參數 + L=1 一根 bias                = 1
+    """
+    layer = layers.Layer({0: [1]}, RBF_COUNT, output_dim=4)
+    assert len(list(layer.parameters())) == 8 + 3 + 1
+
+
+# --- 完整一層的等變性 -----------------------------------------------------
+
+
+def test_layer_is_rotation_equivariant():
+    """L=0 的輸出在旋轉下不變、L=1 的輸出跟著轉。
+
+    輸入是全 1 的 L=0 特徵，本身不隨旋轉變；所以這裡量到的完全是這一層
+    自己的等變性。
+    """
+    layer = layers.Layer({0: [1]}, RBF_COUNT, output_dim=4)
+    points = geometry(POINTS)
+    rotation = utils.random_rotation_matrix(7)
+
+    def run(pts):
+        return layer(scalar_input(), rbf_expansion(pts), utils.difference_matrix(pts))
+
+    before = run(points)
+    after = run(points @ rotation.T)
+
+    assert torch.allclose(after[0][0], before[0][0], atol=1e-5)
+    assert torch.allclose(after[1][0], rotate(before[1][0], rotation), atol=1e-5)
+
+
+def test_layer_output_is_not_trivially_constant():
+    """反面對照：L=1 的輸出真的會被旋轉改變，等變性不是靠全零蒙混。"""
+    layer = layers.Layer({0: [1]}, RBF_COUNT, output_dim=4)
+    points = geometry(POINTS)
+    rotation = utils.random_rotation_matrix(7)
+
+    def run(pts):
+        return layer(scalar_input(), rbf_expansion(pts), utils.difference_matrix(pts))
+
+    assert not torch.allclose(run(points @ rotation.T)[1][0], run(points)[1][0], atol=1e-3)
+
+
+def test_layer_is_translation_invariant():
+    layer = layers.Layer({0: [1]}, RBF_COUNT, output_dim=4)
+    points = geometry(POINTS)
+    shift = torch.tensor([1.5, -2.0, 0.7])
+
+    def run(pts):
+        return layer(scalar_input(), rbf_expansion(pts), utils.difference_matrix(pts))
+
+    before = run(points)
+    after = run(points + shift)
+
+    for angular_momentum in before:
+        assert torch.allclose(after[angular_momentum][0], before[angular_momentum][0], atol=1e-5)
+
+
+def test_layers_stack():
+    """一層的輸出通道帳就是下一層的輸入通道帳——票 07 靠這個疊三層。"""
+    first = layers.Layer({0: [1]}, RBF_COUNT, output_dim=4)
+    second = layers.Layer(first.output_channels, RBF_COUNT, output_dim=4)
+    points = geometry(POINTS)
+    rbf, rij = rbf_expansion(points), utils.difference_matrix(points)
+    rotation = utils.random_rotation_matrix(11)
+
+    def run(pts):
+        r, d = rbf_expansion(pts), utils.difference_matrix(pts)
+        return second(first(scalar_input(), r, d), r, d)
+
+    assert first.output_channels == {0: [4], 1: [4]}
+    out = second(first(scalar_input(), rbf, rij), rbf, rij)
+    assert out[0][0].shape == (POINTS, 4, 1)
+    assert out[1][0].shape == (POINTS, 4, 3)
+
+    before, after = run(points), run(points @ rotation.T)
+    assert torch.allclose(after[0][0], before[0][0], atol=1e-5)
+    assert torch.allclose(after[1][0], rotate(before[1][0], rotation), atol=1e-5)

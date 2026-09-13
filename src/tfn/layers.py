@@ -14,6 +14,7 @@ PyTorch 的參數屬於物件，所以 R / F_0 / F_1 都是 nn.Module，建構�
 """
 
 from collections.abc import Callable
+from typing import NamedTuple, cast
 
 import torch
 from torch import Tensor, nn
@@ -31,6 +32,12 @@ __all__ = [
     "filter_1_output_1",
     "SelfInteraction",
     "Nonlinearity",
+    "Convolution",
+    "concatenation",
+    "concatenated_channels",
+    "SelfInteractionStep",
+    "NonlinearityStep",
+    "Layer",
 ]
 
 
@@ -338,3 +345,223 @@ class Nonlinearity(nn.Module):
         norm = norm_with_epsilon(x, dim=-1)
         factor = self.nonlin(norm + self.bias) / norm
         return x * factor.unsqueeze(-1)
+
+
+# --------------------------------------------------------------------------
+# 論文 §5.1 的一個 module：convolution → concatenation → self-interaction
+#                          → nonlinearity
+# --------------------------------------------------------------------------
+#
+# 中間狀態一路都是 Features，也就是 dict[L, list[Tensor]]：鍵是角動量，值是
+# 「這個 L 目前累積了哪幾條特徵」。convolution 會讓 list 變長（每條輸入分裂成
+# 好幾條路徑的輸出），concatenation 再把它壓回每個 L 一條。
+#
+# 這四個步驟各自是獨立可呼叫的單位，與論文的四個具名步驟一比一對應。
+# 帶參數的三個是 nn.Module，concatenation 沒有參數所以是純函式。
+#
+# 名字上的取捨：SelfInteractionStep / NonlinearityStep 的 Step 後綴只是為了
+# 跟票 05 那兩個「作用在單一張量上」的同名模組區分——它們是這裡的零件。
+# Convolution 沒有這個困擾，所以不加後綴。
+
+Features = dict[int, list[Tensor]]
+Channels = dict[int, list[int]]
+
+SUPPORTED_L = (0, 1)
+
+
+class _Path(NamedTuple):
+    """一條卷積路徑要吃哪條輸入、結果算誰的。
+
+    ``paths[k]`` 與 ``_plan[k]`` 是平行的兩份：模組本體必須住在 nn.ModuleList
+    裡才會被註冊，這些純資料則不能塞進去。
+    """
+
+    l_in: int
+    index: int
+    l_out: int
+    needs_rij: bool
+
+
+class Convolution(nn.Module):
+    """把每條輸入特徵沿所有合法路徑跑一遍，依輸出的 L 收集。
+
+    ``(Features, [N, N, rbf_count], [N, N, 3]) -> Features``
+
+    路徑在**建構時**就依 ``input_channels``（``{L: [每條特徵的通道數]}``）決定
+    好，而不是等 forward 看張量形狀——PyTorch 不像 TF1 能延遲建參數，所以下一層
+    要知道自己會收到什麼，得先問得到 :attr:`output_channels`。
+
+    走訪順序照 reference：先依 L 由小到大，同一個 L 內依序處理每條特徵，每條
+    特徵依序試 ``L×0→L``、``1×1→0``（只有 L=1 有）、``L×1→1``。順序會決定
+    concatenation 之後通道的排列，所以照抄。
+    """
+
+    def __init__(
+        self,
+        input_channels: Channels,
+        rbf_count: int,
+        hidden_dim: int | None = None,
+        nonlin: Callable[[Tensor], Tensor] = F.relu,
+    ) -> None:
+        super().__init__()
+        unsupported = sorted(set(input_channels) - set(SUPPORTED_L))
+        if unsupported:
+            raise NotImplementedError(f"L > 1 尚未移植（收到 L={unsupported}）")
+
+        paths: list[nn.Module] = []
+        plan: list[_Path] = []
+        self.output_channels: Channels = {0: [], 1: []}
+
+        def add(
+            path: nn.Module, l_in: int, index: int, channels: int, l_out: int, needs_rij: bool
+        ) -> None:
+            paths.append(path)
+            plan.append(_Path(l_in, index, l_out, needs_rij))
+            self.output_channels[l_out].append(channels)
+
+        for l_in in sorted(input_channels):
+            for index, channels in enumerate(input_channels[l_in]):
+                # 濾波器與輸入共用同一根通道軸（見 _contract），所以濾波器的
+                # output_dim 必須等於這條輸入的通道數
+                kwargs = {"output_dim": channels, "hidden_dim": hidden_dim, "nonlin": nonlin}
+                # L × 0 → L：濾波器不帶角動量，輸入的 L 原樣傳出
+                add(filter_0(rbf_count, **kwargs), l_in, index, channels, l_in, needs_rij=False)
+                if l_in == 1:
+                    # 1 × 1 → 0：內積，把方向資訊收回成純量
+                    add(
+                        filter_1_output_0(rbf_count, **kwargs),
+                        l_in,
+                        index,
+                        channels,
+                        0,
+                        needs_rij=True,
+                    )
+                # L × 1 → 1
+                add(
+                    filter_1_output_1(rbf_count, **kwargs),
+                    l_in,
+                    index,
+                    channels,
+                    1,
+                    needs_rij=True,
+                )
+
+        self.paths = nn.ModuleList(paths)
+        self._plan = plan
+
+    def forward(self, features: Features, rbf: Tensor, rij: Tensor) -> Features:
+        output: Features = {0: [], 1: []}
+        for path, plan in zip(self.paths, self._plan, strict=True):
+            x = features[plan.l_in][plan.index]
+            output[plan.l_out].append(path(x, rbf, rij) if plan.needs_rij else path(x, rbf))
+        return output
+
+
+def concatenation(features: Features) -> Features:
+    """沿通道軸串接，每個 L 壓回一條特徵。
+
+    卷積把一條輸入分裂成好幾條路徑的輸出，這一步把同一個 L 的重新併成一條，
+    後面的 self-interaction 才有單一的通道軸可以混。
+    """
+    return {angular_momentum: [torch.cat(ts, dim=-2)] for angular_momentum, ts in features.items()}
+
+
+def concatenated_channels(channels: Channels) -> Channels:
+    """:func:`concatenation` 對應的通道帳。"""
+    return {angular_momentum: [sum(cs)] for angular_momentum, cs in channels.items()}
+
+
+class _PerTensorStep(nn.Module):
+    """對 Features 裡每一條張量各作用一個子模組的步驟。
+
+    子模組住在 ``nn.ModuleDict[str, nn.ModuleList]``：ModuleDict 的鍵只能是
+    字串，所以 L 要轉成 str。用普通的 dict / list 會讓這些子模組完全不出現在
+    ``parameters()`` 裡——訓練照跑、loss 也會降，但它們永遠不學。
+    """
+
+    def __init__(self, modules_by_l: dict[int, list[nn.Module]]) -> None:
+        super().__init__()
+        self.layers = nn.ModuleDict(
+            {
+                str(angular_momentum): nn.ModuleList(ms)
+                for angular_momentum, ms in modules_by_l.items()
+            }
+        )
+
+    def forward(self, features: Features) -> Features:
+        output: Features = {}
+        for angular_momentum, ts in features.items():
+            # ModuleDict 取回來的靜態型別只到 Module，實際上是 ModuleList
+            modules = cast(nn.ModuleList, self.layers[str(angular_momentum)])
+            output[angular_momentum] = [m(t) for m, t in zip(modules, ts, strict=True)]
+        return output
+
+
+class SelfInteractionStep(_PerTensorStep):
+    """對每條特徵做通道混合，全部混到同一個 ``output_dim``。
+
+    L=0 用有 bias 的版本、L>0 用無 bias 的——理由見 :class:`SelfInteraction`。
+    """
+
+    def __init__(self, input_channels: Channels, output_dim: int) -> None:
+        super().__init__(
+            {
+                angular_momentum: [
+                    SelfInteraction(c, output_dim, bias=(angular_momentum == 0)) for c in cs
+                ]
+                for angular_momentum, cs in input_channels.items()
+            }
+        )
+        self.output_channels: Channels = {
+            angular_momentum: [output_dim] * len(cs)
+            for angular_momentum, cs in input_channels.items()
+        }
+
+
+class NonlinearityStep(_PerTensorStep):
+    """對每條特徵套用旋轉等變的非線性。通道數與 L 都不變。"""
+
+    def __init__(
+        self, input_channels: Channels, nonlin: Callable[[Tensor], Tensor] = F.elu
+    ) -> None:
+        super().__init__(
+            {
+                angular_momentum: [Nonlinearity(c, angular_momentum, nonlin=nonlin) for c in cs]
+                for angular_momentum, cs in input_channels.items()
+            }
+        )
+        self.output_channels: Channels = dict(input_channels)
+
+
+class Layer(nn.Module):
+    """論文 §5.1 的一個 module，四個步驟串起來。
+
+    ``(Features, [N, N, rbf_count], [N, N, 3]) -> Features``
+
+    :attr:`output_channels` 就是下一層的 ``input_channels``，票 07 靠這個疊三層。
+    """
+
+    def __init__(
+        self,
+        input_channels: Channels,
+        rbf_count: int,
+        output_dim: int,
+        hidden_dim: int | None = None,
+        radial_nonlin: Callable[[Tensor], Tensor] = F.relu,
+        nonlin: Callable[[Tensor], Tensor] = F.elu,
+    ) -> None:
+        super().__init__()
+        self.convolution = Convolution(
+            input_channels, rbf_count, hidden_dim=hidden_dim, nonlin=radial_nonlin
+        )
+        self.self_interaction = SelfInteractionStep(
+            concatenated_channels(self.convolution.output_channels), output_dim
+        )
+        self.nonlinearity = NonlinearityStep(self.self_interaction.output_channels, nonlin=nonlin)
+        self.output_channels: Channels = self.nonlinearity.output_channels
+
+    def forward(self, features: Features, rbf: Tensor, rij: Tensor) -> Features:
+        features = self.convolution(features, rbf, rij)
+        features = concatenation(features)
+        features = self.self_interaction(features)
+        return self.nonlinearity(features)
