@@ -222,3 +222,212 @@ def test_F_1_is_translation_invariant():
     before = f1(rbf_expansion(points), utils.difference_matrix(points))
     after = f1(rbf_expansion(points + shift), utils.difference_matrix(points + shift))
     assert torch.allclose(after, before, atol=1e-5)
+
+
+# --------------------------------------------------------------------------
+# CG 收縮：三條濾波路徑
+# --------------------------------------------------------------------------
+
+CHANNELS = 2
+POINTS = 5
+
+# 三條路徑，以及各自吃什麼 L、吐什麼 L。filter_0 與 filter_1_output_1
+# 各接受兩種輸入 L，所以是五個組合。
+PATHS = [
+    ("filter_0 : L=0 -> L=0", layers.filter_0, 0, 0),
+    ("filter_0 : L=1 -> L=1", layers.filter_0, 1, 1),
+    ("filter_1_output_0 : L=1 -> L=0", layers.filter_1_output_0, 1, 0),
+    ("filter_1_output_1 : L=0 -> L=1", layers.filter_1_output_1, 0, 1),
+    ("filter_1_output_1 : L=1 -> L=1", layers.filter_1_output_1, 1, 1),
+]
+PATH_IDS = [path[0] for path in PATHS]
+
+
+def features(angular_momentum: int, channels: int = CHANNELS, seed: int = 1) -> torch.Tensor:
+    """``[N, C, 2L+1]`` 的輸入特徵。"""
+    g = torch.Generator().manual_seed(seed)
+    return torch.randn(POINTS, channels, 2 * angular_momentum + 1, generator=g)
+
+
+def apply_path(path: torch.nn.Module, layer_input: torch.Tensor, points: torch.Tensor):
+    """呼叫方式差在要不要 rij——filter_0 的濾波器不帶角度部分。"""
+    rbf = rbf_expansion(points)
+    if isinstance(path, layers.filter_0):
+        return path(layer_input, rbf)
+    return path(layer_input, rbf, utils.difference_matrix(points))
+
+
+def rotate(t: torch.Tensor, rotation: torch.Tensor) -> torch.Tensor:
+    """把最後一軸長度 3 的張量整批旋轉。"""
+    return t @ rotation.T
+
+
+# --- 形狀與契約 -----------------------------------------------------------
+
+
+@pytest.mark.parametrize("angular_momentum", [0, 1])
+def test_filter_0_preserves_the_input_angular_momentum(angular_momentum):
+    """L × 0 → L：濾波器不帶角動量，輸入的 L 原封不動傳出去。"""
+    path = layers.filter_0(RBF_COUNT, output_dim=CHANNELS)
+    x = features(angular_momentum)
+    out = apply_path(path, x, geometry(POINTS))
+    assert out.shape == (POINTS, CHANNELS, 2 * angular_momentum + 1)
+
+
+def test_filter_1_output_0_yields_a_scalar():
+    path = layers.filter_1_output_0(RBF_COUNT, output_dim=CHANNELS)
+    out = apply_path(path, features(1), geometry(POINTS))
+    assert out.shape == (POINTS, CHANNELS, 1)
+
+
+def test_filter_1_output_0_rejects_scalar_input():
+    """0 × 1 只能耦合出 L=1，產不出 L=0——這條路徑不存在。"""
+    path = layers.filter_1_output_0(RBF_COUNT, output_dim=CHANNELS)
+    with pytest.raises(ValueError, match="0 x 1 cannot yield 0"):
+        apply_path(path, features(0), geometry(POINTS))
+
+
+@pytest.mark.parametrize("angular_momentum", [0, 1])
+def test_filter_1_output_1_yields_a_vector(angular_momentum):
+    path = layers.filter_1_output_1(RBF_COUNT, output_dim=CHANNELS)
+    out = apply_path(path, features(angular_momentum), geometry(POINTS))
+    assert out.shape == (POINTS, CHANNELS, 3)
+
+
+@pytest.mark.parametrize("cls", [layers.filter_1_output_0, layers.filter_1_output_1])
+def test_L_1_filters_reject_unsupported_angular_momenta(cls):
+    """L=2 以上還沒移植，要明講而不是算出一個形狀對、意思錯的東西。
+
+    filter_0 不在此列：它的 CG 是 eye(2L+1)，對任何 L 都成立，上游同樣
+    沒有這個分支。會卡住的是帶角動量的濾波器——那才需要真正的 CG 表。
+    """
+    path = cls(RBF_COUNT, output_dim=CHANNELS)
+    with pytest.raises(NotImplementedError):
+        apply_path(path, features(2), geometry(POINTS))
+
+
+def test_filter_0_works_for_any_angular_momentum():
+    """反過來說，L × 0 → L 對 L=2 也是對的，不該擋。"""
+    path = layers.filter_0(RBF_COUNT, output_dim=CHANNELS)
+    out = apply_path(path, features(2), geometry(POINTS))
+    assert out.shape == (POINTS, CHANNELS, 5)
+
+
+# --- 符號釘死 -------------------------------------------------------------
+#
+# 本票最大的風險：einsum 索引排錯、或 ε 符號弄反，訓練 loss 照樣會降
+# （訓練集只有單一朝向，背起來就好），要到測試集才發現。所以這裡把每條
+# 路徑的收縮結果與手算的張量運算逐元素比對，不看 loss。
+#
+# 手算時直接取用 path.filter 的輸出：要釘的是「收縮」這一步，不是濾波器
+# 本身——濾波器已經在上面驗過了。
+
+
+def test_filter_0_contraction_is_a_scalar_rescale():
+    """CG 是單位矩陣，所以收縮就是「用徑向權重加權、對鄰居求和」。"""
+    path = layers.filter_0(RBF_COUNT, output_dim=CHANNELS)
+    points = geometry(POINTS)
+    x = features(1)
+    rbf = rbf_expansion(points)
+
+    out = path(x, rbf)
+    f0 = path.filter(rbf)  # [N, N, C, 1]
+    manual = (f0 * x.unsqueeze(0)).sum(dim=1)  # 對鄰居 b 求和
+
+    assert torch.allclose(out, manual, atol=1e-6)
+
+
+def test_filter_1_output_0_contraction_is_an_inner_product():
+    """1 × 1 → 0 的 CG 是 δ_jk，收縮就是內積。"""
+    path = layers.filter_1_output_0(RBF_COUNT, output_dim=CHANNELS)
+    points = geometry(POINTS)
+    x = features(1)
+    rbf, rij = rbf_expansion(points), utils.difference_matrix(points)
+
+    out = path(x, rbf, rij)
+    f1 = path.filter(rbf, rij)  # [N, N, C, 3]
+    manual = (f1 * x.unsqueeze(0)).sum(dim=-1, keepdim=True).sum(dim=1)
+
+    assert torch.allclose(out, manual, atol=1e-6)
+
+
+def test_filter_1_output_1_contraction_on_scalars_is_a_rescale():
+    """0 × 1 → 1 的 CG 是 eye(3)：純量只縮放濾波器的方向，不改方向。"""
+    path = layers.filter_1_output_1(RBF_COUNT, output_dim=CHANNELS)
+    points = geometry(POINTS)
+    x = features(0)
+    rbf, rij = rbf_expansion(points), utils.difference_matrix(points)
+
+    out = path(x, rbf, rij)
+    f1 = path.filter(rbf, rij)
+    manual = (f1 * x.unsqueeze(0)).sum(dim=1)  # x 的最後一軸長度 1，會廣播
+
+    assert torch.allclose(out, manual, atol=1e-6)
+
+
+def test_filter_1_output_1_contraction_is_exactly_the_cross_product():
+    """1 × 1 → 1 的 CG 是 Levi-Civita，收縮逐元素等於外積——含符號。
+
+    ε 的符號弄反、或 einsum 把 j / k 排反，結果就是外積取負，這條會抓到。
+    順序是 filter × input：ε_ijk F_j x_k = (F × x)_i。
+    """
+    path = layers.filter_1_output_1(RBF_COUNT, output_dim=CHANNELS)
+    points = geometry(POINTS)
+    x = features(1)
+    rbf, rij = rbf_expansion(points), utils.difference_matrix(points)
+
+    out = path(x, rbf, rij)
+    f1 = path.filter(rbf, rij)  # [N, N, C, 3]
+    manual = torch.linalg.cross(f1, x.unsqueeze(0).expand_as(f1), dim=-1).sum(dim=1)
+
+    assert torch.allclose(out, manual, atol=1e-6)
+
+
+def test_filter_1_output_1_is_not_the_negated_cross_product():
+    """反面對照：確認上一條不是在比對兩個都反了號的東西。"""
+    path = layers.filter_1_output_1(RBF_COUNT, output_dim=CHANNELS)
+    points = geometry(POINTS)
+    x = features(1)
+    rbf, rij = rbf_expansion(points), utils.difference_matrix(points)
+
+    out = path(x, rbf, rij)
+    f1 = path.filter(rbf, rij)
+    flipped = torch.linalg.cross(x.unsqueeze(0).expand_as(f1), f1, dim=-1).sum(dim=1)
+
+    assert not torch.allclose(out, flipped, atol=1e-3)
+
+
+# --- 等變性（本票關卡）----------------------------------------------------
+
+
+@pytest.mark.parametrize(("name", "cls", "l_in", "l_out"), PATHS, ids=PATH_IDS)
+def test_path_is_rotation_equivariant(name, cls, l_in, l_out):
+    """座標與輸入特徵一起轉 R，輸出就照它自己的 L 跟著轉。
+
+    L=0 的輸出不動、L=1 的輸出轉 R。三條路徑各自獨立驗，不靠組合結果掩護。
+    """
+    path = cls(RBF_COUNT, output_dim=CHANNELS)
+    points = geometry(POINTS)
+    x = features(l_in)
+    rotation = utils.random_rotation_matrix(7)
+
+    before = apply_path(path, x, points)
+    rotated_x = rotate(x, rotation) if l_in == 1 else x
+    after = apply_path(path, rotated_x, points @ rotation.T)
+
+    expected = rotate(before, rotation) if l_out == 1 else before
+    assert torch.allclose(after, expected, atol=1e-5)
+
+
+@pytest.mark.parametrize(("name", "cls", "l_in", "l_out"), PATHS, ids=PATH_IDS)
+def test_path_is_translation_invariant(name, cls, l_in, l_out):
+    """濾波器只看點對之間的相對位置，整體平移看不見。"""
+    path = cls(RBF_COUNT, output_dim=CHANNELS)
+    points = geometry(POINTS)
+    x = features(l_in)
+    shift = torch.tensor([1.5, -2.0, 0.7])
+
+    before = apply_path(path, x, points)
+    after = apply_path(path, x, points + shift)
+
+    assert torch.allclose(after, before, atol=1e-5)

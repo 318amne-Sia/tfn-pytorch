@@ -19,9 +19,17 @@ import torch
 from torch import Tensor, nn
 from torch.nn import functional as F
 
-from tfn.utils import EPSILON, norm_with_epsilon
+from tfn.utils import EPSILON, get_eijk, norm_with_epsilon
 
-__all__ = ["R", "F_0", "F_1", "unit_vectors"]
+__all__ = [
+    "R",
+    "F_0",
+    "F_1",
+    "unit_vectors",
+    "filter_0",
+    "filter_1_output_0",
+    "filter_1_output_1",
+]
 
 
 def unit_vectors(v: Tensor, dim: int = -1) -> Tensor:
@@ -123,3 +131,125 @@ class F_1(nn.Module):
 
         # [N, N, 1, 3] * [N, N, output_dim, 1] -> [N, N, output_dim, 3]
         return unit_vectors(rij).unsqueeze(-2) * masked_radial.unsqueeze(-1)
+
+
+# --------------------------------------------------------------------------
+# CG 收縮：三條濾波路徑
+# --------------------------------------------------------------------------
+#
+# 論文 §4.2：把 L_f 階的濾波器與 L_in 階的輸入特徵，依 Clebsch-Gordan 係數
+# 耦合成 L_out 階的輸出。角動量耦合規則 |L_f - L_in| ≤ L_out ≤ L_f + L_in
+# 決定了哪些路徑存在——實驗一只用到 L ≤ 1，於是剩下四種組合、三個模組。
+#
+# 這裡的 CG 都沒有做歸一化（真正的係數還差一個常數倍）。那個常數是每條路徑
+# 一個全域純量，會被 R 的權重吸收掉，所以照上游省略。
+
+
+def _contract(cg: Tensor, filter_out: Tensor, layer_input: Tensor) -> Tensor:
+    """CG 收縮。三條路徑共用這一個式子，差別只在 ``cg``。
+
+    ``([2Lo+1, 2Lf+1, 2Li+1], [N, N, C, 2Lf+1], [N, C, 2Li+1]) -> [N, C, 2Lo+1]``
+
+    索引::
+
+        a  輸出的那個點
+        b  鄰居；它被求和掉——這一步就是「卷積」的加總
+        f  通道。濾波器與輸入共用同一根通道軸，所以濾波器的 output_dim
+           必須等於輸入的通道數（呼叫端負責，見票 06 的通道帳）
+        i  輸出的角動量分量、j 濾波器的、k 輸入的；三者由 cg 綁在一起
+    """
+    return torch.einsum("ijk,abfj,bfk->afi", cg, filter_out, layer_input)
+
+
+# 三個路徑類別沿用上游的小寫命名（同 F_0 / F_1），方便與 reference 逐行對照。
+class filter_0(nn.Module):
+    """L × 0 → L。``([N, C, 2L+1], [N, N, input_dim]) -> [N, C, 2L+1]``
+
+    濾波器不帶角動量（L_f = 0），耦合規則只允許 L_out = L_in，CG 是單位矩陣。
+    直觀上就是：用徑向權重把鄰居的特徵加權求和，方向資訊原封不動。
+    """
+
+    def __init__(
+        self,
+        input_dim: int,
+        output_dim: int = 1,
+        hidden_dim: int | None = None,
+        nonlin: Callable[[Tensor], Tensor] = F.relu,
+    ) -> None:
+        super().__init__()
+        self.filter = F_0(input_dim, output_dim=output_dim, hidden_dim=hidden_dim, nonlin=nonlin)
+
+    def forward(self, layer_input: Tensor, rbf: Tensor) -> Tensor:
+        # [N, N, C, 1]
+        filter_out = self.filter(rbf)
+        dim = layer_input.shape[-1]
+        # [2L+1, 1, 2L+1]：中間那根是濾波器的角度軸，L_f = 0 所以長度 1
+        cg = torch.eye(dim, device=layer_input.device, dtype=layer_input.dtype).unsqueeze(-2)
+        return _contract(cg, filter_out, layer_input)
+
+
+class filter_1_output_0(nn.Module):
+    """1 × 1 → 0。``([N, C, 3], [N, N, input_dim], [N, N, 3]) -> [N, C, 1]``
+
+    兩個向量縮成純量，CG 是 δ_jk，收縮就是內積。這是網路把方向資訊轉回
+    旋轉不變量的唯一管道——票 07 最後拿去分類的就是這種 L=0 特徵。
+    """
+
+    def __init__(
+        self,
+        input_dim: int,
+        output_dim: int = 1,
+        hidden_dim: int | None = None,
+        nonlin: Callable[[Tensor], Tensor] = F.relu,
+    ) -> None:
+        super().__init__()
+        self.filter = F_1(input_dim, output_dim=output_dim, hidden_dim=hidden_dim, nonlin=nonlin)
+
+    def forward(self, layer_input: Tensor, rbf: Tensor, rij: Tensor) -> Tensor:
+        # [N, N, C, 3]
+        filter_out = self.filter(rbf, rij)
+        dim = layer_input.shape[-1]
+        if dim == 1:
+            # 0 ⊗ 1 只耦合得出 L=1，這條路徑不存在。要 L=1 輸出請用
+            # filter_1_output_1。
+            raise ValueError("0 x 1 cannot yield 0：L=0 的輸入配 L=1 的濾波器只能得到 L=1")
+        if dim != 3:
+            raise NotImplementedError(f"L > 1 尚未移植（輸入的最後一軸為 {dim}）")
+        # [1, 3, 3]
+        cg = torch.eye(3, device=layer_input.device, dtype=layer_input.dtype).unsqueeze(0)
+        return _contract(cg, filter_out, layer_input)
+
+
+class filter_1_output_1(nn.Module):
+    """L × 1 → 1。``([N, C, 2L+1], [N, N, input_dim], [N, N, 3]) -> [N, C, 3]``
+
+    輸入 L=0 時 CG 是 ``eye(3)``：純量只縮放濾波器的方向。
+    輸入 L=1 時 CG 是 Levi-Civita，收縮起來恰好是外積 ``F × x``。
+
+    外積這條是本票的符號風險所在：ε 的符號或 einsum 的 j / k 排反，結果會
+    整個取負，而 loss 照樣降得下去。測試拿 ``torch.linalg.cross`` 逐元素釘死。
+    """
+
+    def __init__(
+        self,
+        input_dim: int,
+        output_dim: int = 1,
+        hidden_dim: int | None = None,
+        nonlin: Callable[[Tensor], Tensor] = F.relu,
+    ) -> None:
+        super().__init__()
+        self.filter = F_1(input_dim, output_dim=output_dim, hidden_dim=hidden_dim, nonlin=nonlin)
+
+    def forward(self, layer_input: Tensor, rbf: Tensor, rij: Tensor) -> Tensor:
+        # [N, N, C, 3]
+        filter_out = self.filter(rbf, rij)
+        dim = layer_input.shape[-1]
+        if dim == 1:
+            # 0 × 1 -> 1，CG 形狀 [3, 3, 1]
+            cg = torch.eye(3, device=layer_input.device, dtype=layer_input.dtype).unsqueeze(-1)
+        elif dim == 3:
+            # 1 × 1 -> 1，CG 形狀 [3, 3, 3]
+            cg = get_eijk(device=layer_input.device, dtype=layer_input.dtype)
+        else:
+            raise NotImplementedError(f"L > 1 尚未移植（輸入的最後一軸為 {dim}）")
+        return _contract(cg, filter_out, layer_input)
