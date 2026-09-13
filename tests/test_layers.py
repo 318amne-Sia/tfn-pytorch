@@ -15,8 +15,7 @@ from torch.nn import functional as F
 
 from tfn import layers, utils
 
-# 與上游 notebook 第 3 格相同的 RBF 設定。這段屬於實驗設定（票 07 的
-# notebook）而不是濾波器本身，所以留在測試裡當 fixture，不進 tfn。
+# 與上游 notebook 第 3 格相同的 RBF 設定（票 07 的實驗值）。
 RBF_LOW = 0.0
 RBF_HIGH = 3.5
 RBF_COUNT = 4
@@ -28,11 +27,9 @@ def rbf_expansion(geometry: torch.Tensor) -> torch.Tensor:
     距離是旋轉不變也是平移不變的，所以 rbf 在等變性測試裡是常數——
     F_1 輸出會轉，靠的全是角度部分。
     """
-    spacing = (RBF_HIGH - RBF_LOW) / RBF_COUNT
-    centers = torch.linspace(RBF_LOW, RBF_HIGH, RBF_COUNT)
-    gamma = 1.0 / spacing
-    dij = utils.distance_matrix(geometry)
-    return torch.exp(-gamma * (dij.unsqueeze(-1) - centers) ** 2)
+    return utils.rbf_expansion(
+        utils.distance_matrix(geometry), low=RBF_LOW, high=RBF_HIGH, count=RBF_COUNT
+    )
 
 
 def geometry(n: int = 5, seed: int = 0) -> torch.Tensor:

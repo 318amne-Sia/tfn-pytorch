@@ -10,7 +10,7 @@ TF 1.15 最高只支援 Python 3.7，macOS arm64 根本沒有 wheel，Colab 也�
 
 | 實驗 | 論文章節 | 狀態 |
 | --- | --- | --- |
-| shape classification（3D Tetris） | §5.1 | 進行中 |
+| shape classification（3D Tetris） | §5.1 | 完成——測試準確率 100% |
 | moment of inertia | §5.2 | 未開始 |
 | missing point（QM9） | §5.3 | 未開始 |
 
@@ -43,11 +43,12 @@ Colab 的 pip 安裝不持久，換一台 VM 就沒了，所以這格每個 sess
 所以寫程式和跑測試都在本機做，Colab 只用來驗收整條管線。
 
 ```sh
-uv sync                # 建 Python 3.12 環境（對齊 Colab 的 3.12.13）並安裝
-uv run pytest          # 測試
-uv run ruff check .    # lint
-uv run ruff format .   # 格式化
-uv run pyright         # 型別檢查
+uv sync                        # 建 Python 3.12 環境（對齊 Colab 的 3.12.13）並安裝
+uv run pytest                  # 測試
+uv run pytest -m "not slow"    # 跳過需要實際訓練的那兩條（省約 8 秒）
+uv run ruff check .            # lint
+uv run ruff format .           # 格式化
+uv run pyright                 # 型別檢查
 ```
 
 `ruff` 與 `pyright` 只在本機開發時用，不是執行期依賴，
@@ -69,6 +70,23 @@ uv run pyright         # 型別檢查
 | `tests/` | 測試。核心是等變性測試：旋轉輸入後 L=0 輸出不變、L=1 輸出跟著轉 |
 | `notebooks/` | 各實驗的 notebook |
 | `reference/` | 作者原始 TF1 實作，**唯讀對照用，不要改** |
+
+## 實驗一：3D Tetris 形狀分類
+
+`notebooks/shape_classification.ipynb`（本機約 20 秒，Colab 同樣跑得完）。
+
+論文 §5.1 的主張是：訓練只餵單一朝向、完全不做旋轉資料增強，測試時餵隨機旋轉
+**且平移**過的同一批形狀，仍然全部分對。復現結果：200 個樣本（25 輪 × 8 形狀）
+準確率 **100%**，兩個鏡像形狀 `chiral_shape_1` / `chiral_shape_2` 零混淆。
+
+等變性是結構帶來的，不是訓練出來的——notebook 裡有一格驗證**還沒訓練**的模型
+對旋轉加平移的 logits 偏差就只有 1e-7。
+
+與上游 notebook 的兩處差異：
+
+- 上游測試迴圈算了 `translated_shape` 卻把 `rotated_shape` 餵進去，平移那半
+  從來沒被測到。這裡修掉了。
+- epoch 數取 1000（上游 2001）。實測 5 個不同 seed 在 600 epochs 就全部到 100%。
 
 ## reference/ 是什麼
 

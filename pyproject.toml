@@ -36,6 +36,8 @@ dev = [
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+# 預設會跑；要跳過實際訓練用 `uv run pytest -m "not slow"`
+markers = ["slow: 需要實際訓練，數十秒等級"]
 
 [tool.ruff]
 line-length = 100

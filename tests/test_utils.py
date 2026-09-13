@@ -198,6 +198,50 @@ def test_geometry_helpers_follow_input_device(device):
 
 
 # --------------------------------------------------------------------------
+# RBF 展開
+# --------------------------------------------------------------------------
+
+
+def test_rbf_expansion_adds_one_axis_per_centre():
+    d = utils.distance_matrix(torch.randn(5, 3))
+    assert utils.rbf_expansion(d, low=0.0, high=3.5, count=4).shape == (5, 5, 4)
+
+
+def test_rbf_expansion_peaks_at_its_centres():
+    """距離剛好落在某個中心上時，那一格的響應是 1，其餘都更小。"""
+    centers = torch.linspace(0.0, 3.5, 4)
+    got = utils.rbf_expansion(centers, low=0.0, high=3.5, count=4)
+    for i, row in enumerate(got):
+        assert row[i].item() == pytest.approx(1.0, abs=1e-6)
+        assert row.argmax().item() == i
+
+
+def test_rbf_expansion_matches_the_upstream_formula():
+    """上游寫成 exp(-gamma · (d - c)²)，gamma = 1 / 中心間距。"""
+    low, high, count = 0.0, 3.5, 4
+    d = utils.distance_matrix(torch.randn(4, 3))
+    gamma = 1.0 / ((high - low) / count)
+    expected = torch.exp(-gamma * (d.unsqueeze(-1) - torch.linspace(low, high, count)) ** 2)
+    assert torch.allclose(utils.rbf_expansion(d, low=low, high=high, count=count), expected)
+
+
+def test_rbf_expansion_is_invariant_to_rigid_motion():
+    """它只吃距離，所以旋轉與平移都看不見——票 03 以後的等變性測試靠這點。"""
+    points = torch.randn(5, 3)
+    moved = points @ utils.random_rotation_matrix(0).T + torch.tensor([1.5, -2.0, 0.7])
+    kwargs = {"low": 0.0, "high": 3.5, "count": 4}
+    before = utils.rbf_expansion(utils.distance_matrix(points), **kwargs)
+    after = utils.rbf_expansion(utils.distance_matrix(moved), **kwargs)
+    assert torch.allclose(after, before, atol=1e-5)
+
+
+@pytest.mark.parametrize("device", DEVICES)
+def test_rbf_expansion_follows_input_device(device):
+    d = utils.distance_matrix(torch.randn(4, 3, device=device))
+    assert utils.rbf_expansion(d, low=0.0, high=3.5, count=4).device.type == device
+
+
+# --------------------------------------------------------------------------
 # 旋轉矩陣
 # --------------------------------------------------------------------------
 

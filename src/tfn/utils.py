@@ -89,6 +89,20 @@ def distance_matrix(geometry: Tensor) -> Tensor:
     return norm_with_epsilon(difference_matrix(geometry), dim=-1)
 
 
+def rbf_expansion(distances: Tensor, *, low: float, high: float, count: int) -> Tensor:
+    """把距離展開成一組高斯基底。``[...] -> [..., count]``
+
+    論文 §5 說 radial function 與 SchNet 相同：距離先攤成 ``count`` 個等距
+    中心上的高斯響應，再餵進 MLP（:class:`~tfn.layers.R`）。直接把純量距離
+    餵進 MLP 學不動——展開之後每個中心各自負責一段距離區間，網路才有東西可分。
+
+    高斯的寬度取中心間距（``gamma = 1 / spacing``），與上游 notebook 相同。
+    """
+    spacing = (high - low) / count
+    centers = torch.linspace(low, high, count, device=distances.device, dtype=distances.dtype)
+    return torch.exp(-((distances.unsqueeze(-1) - centers) ** 2) / spacing)
+
+
 def rotation_matrix(
     axis: npt.ArrayLike,
     theta: float,
