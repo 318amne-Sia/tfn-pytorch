@@ -29,6 +29,8 @@ __all__ = [
     "filter_0",
     "filter_1_output_0",
     "filter_1_output_1",
+    "SelfInteraction",
+    "Nonlinearity",
 ]
 
 
@@ -253,3 +255,86 @@ class filter_1_output_1(nn.Module):
         else:
             raise NotImplementedError(f"L > 1 尚未移植（輸入的最後一軸為 {dim}）")
         return _contract(cg, filter_out, layer_input)
+
+
+# --------------------------------------------------------------------------
+# 一層裡不涉及點對關係的兩個運算
+# --------------------------------------------------------------------------
+
+
+class SelfInteraction(nn.Module):
+    """沿通道軸的線性混合。``[N, C_in, 2L+1] -> [N, C_out, 2L+1]``
+
+    每個點各自做，不看鄰居；動的是通道數，L 原封不動。角動量那根軸完全沒被
+    碰到，所以（不加 bias 的話）等變性是白拿的。
+
+    ``bias`` 沒有預設值，必須明講：**L=0 用 True、L>0 用 False**。bias 是每個
+    通道一個純量，會被加到 2L+1 個分量上——那等於加了一個固定向量，它不隨
+    座標旋轉，L>0 的等變性一加就破。這件事錯了不會報錯也不會讓 loss 變難看，
+    所以寧可讓呼叫端每次都寫出來。
+
+    實作上就是一個 nn.Linear 作用在通道軸上：它的 weight 形狀 ``[C_out, C_in]``
+    恰好等於上游 ``w_si`` 的形狀，bias 形狀 ``[C_out]`` 也對得上。上游那句
+    einsum 加轉置（``'afi,gf->aig'`` 再 permute）算的是同一件事。
+    """
+
+    def __init__(self, input_dim: int, output_dim: int, *, bias: bool) -> None:
+        super().__init__()
+        self.linear = nn.Linear(input_dim, output_dim, bias=bias)
+        # 對齊作者的 orthogonal_initializer / constant_initializer(0.)
+        nn.init.orthogonal_(self.linear.weight)
+        if self.linear.bias is not None:
+            nn.init.zeros_(self.linear.bias)
+
+    def forward(self, x: Tensor) -> Tensor:
+        # 通道軸換到最後讓 nn.Linear 吃，算完換回來
+        return self.linear(x.transpose(-2, -1)).transpose(-2, -1)
+
+
+class Nonlinearity(nn.Module):
+    """旋轉等變的非線性。``[N, C, 2L+1] -> [N, C, 2L+1]``
+
+    L>0 時只縮放特徵的範數、不改變方向：非線性作用在範數上（那是旋轉不變量），
+    得到的倍率再乘回原向量。方向一動就破壞等變性，所以不能逐元素套用。
+
+    L=0 時直接套用非線性，**不加 bias**——與作者一致。論文 §4.3 寫的是
+    ``η(‖V‖ + b)``，L=0 時退化成 ``η(V + b)``；但這一步的前面永遠是
+    self-interaction，而 L=0 的 self-interaction 已經加過一個 per-channel
+    bias 了，再加一個只是把它重新參數化成 ``b₁ + b₂``，多一組永遠學不出
+    獨立作用的參數。
+
+    L 在建構時就綁定，因為 L>0 的 bias 形狀取決於它——不像票 04 的濾波路徑
+    可以等到 forward 再看輸入的形狀決定。上游在 L=0 時仍然建了一個 biases
+    變數卻沒用到，這裡不照抄那顆死參數。
+    """
+
+    def __init__(
+        self,
+        channels: int,
+        angular_momentum: int,
+        nonlin: Callable[[Tensor], Tensor] = F.elu,
+    ) -> None:
+        super().__init__()
+        self.angular_momentum = angular_momentum
+        self.nonlin = nonlin
+        if angular_momentum == 0:
+            # 同 nn.Linear(bias=False) 的作法：明確登記成 None，而不是
+            # 擺一個普通屬性
+            self.register_parameter("bias", None)
+        else:
+            self.bias = nn.Parameter(torch.zeros(channels))
+
+    def forward(self, x: Tensor) -> Tensor:
+        expected = 2 * self.angular_momentum + 1
+        if x.shape[-1] != expected:
+            raise ValueError(
+                f"angular_momentum={self.angular_momentum} 需要最後一軸為 {expected}，"
+                f"收到 {x.shape[-1]}"
+            )
+        if self.bias is None:
+            return self.nonlin(x)
+
+        # [N, C]：範數是旋轉不變量，bias 與非線性都安全地作用在這上面
+        norm = norm_with_epsilon(x, dim=-1)
+        factor = self.nonlin(norm + self.bias) / norm
+        return x * factor.unsqueeze(-1)

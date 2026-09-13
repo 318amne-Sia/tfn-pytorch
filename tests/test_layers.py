@@ -10,6 +10,7 @@ import math
 
 import pytest
 import torch
+from torch.nn import functional as F
 
 from tfn import layers, utils
 
@@ -429,5 +430,192 @@ def test_path_is_translation_invariant(name, cls, l_in, l_out):
 
     before = apply_path(path, x, points)
     after = apply_path(path, x, points + shift)
+
+    assert torch.allclose(after, before, atol=1e-5)
+
+
+# --------------------------------------------------------------------------
+# SelfInteraction：沿通道軸的線性混合
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("angular_momentum", [0, 1])
+def test_self_interaction_mixes_channels_and_keeps_L(angular_momentum):
+    """每個點各自做，不看鄰居；動的是通道數，不是 L。"""
+    si = layers.SelfInteraction(CHANNELS, 7, bias=False)
+    out = si(features(angular_momentum))
+    assert out.shape == (POINTS, 7, 2 * angular_momentum + 1)
+
+
+def test_self_interaction_weights_are_orthogonal():
+    """對齊作者的 orthogonal_initializer。
+
+    輸出通道少於輸入時，正交的是列（W Wᵀ = I）。
+    """
+    si = layers.SelfInteraction(8, 4, bias=False)
+    w = si.linear.weight
+    assert torch.allclose(w @ w.T, torch.eye(4), atol=1e-5)
+
+
+def test_self_interaction_bias_starts_at_zero():
+    si = layers.SelfInteraction(CHANNELS, CHANNELS, bias=True)
+    assert si.linear.bias is not None
+    assert torch.equal(si.linear.bias, torch.zeros_like(si.linear.bias))
+
+
+def test_self_interaction_without_bias_has_no_bias_parameter():
+    si = layers.SelfInteraction(CHANNELS, CHANNELS, bias=False)
+    assert si.linear.bias is None
+    assert len(list(si.parameters())) == 1
+
+
+def test_self_interaction_without_bias_is_rotation_equivariant():
+    si = layers.SelfInteraction(CHANNELS, 3, bias=False)
+    x = features(1)
+    rotation = utils.random_rotation_matrix(7)
+    assert torch.allclose(si(rotate(x, rotation)), rotate(si(x), rotation), atol=1e-5)
+
+
+def test_self_interaction_with_bias_breaks_equivariance_for_L_1():
+    """這就是 L>0 不能加 bias 的理由，直接驗給它看。
+
+    bias 是每個通道一個純量，加在 2L+1 個分量上——那是個固定的向量，
+    不會跟著旋轉，所以它一進來等變性就破了。bias 初始化是 0，要填非零
+    才問得出這件事。
+    """
+    si = layers.SelfInteraction(CHANNELS, 3, bias=True)
+    with torch.no_grad():
+        si.linear.bias.fill_(0.5)
+    x = features(1)
+    rotation = utils.random_rotation_matrix(7)
+    assert not torch.allclose(si(rotate(x, rotation)), rotate(si(x), rotation), atol=1e-3)
+
+
+def test_self_interaction_with_bias_is_safe_for_L_0():
+    """L=0 那邊 bias 無害，所以純量才用有 bias 版。
+
+    直接對 L=0 特徵轉一轉是問不出東西的——它本來就不隨旋轉變。要讓旋轉
+    真的進到式子裡，得從座標出發：filter_1_output_0 把 L=1 特徵縮成 L=0，
+    再過有 bias 的 SelfInteraction，整條仍該是旋轉不變的。
+    """
+    path = layers.filter_1_output_0(RBF_COUNT, output_dim=CHANNELS)
+    si = layers.SelfInteraction(CHANNELS, 3, bias=True)
+    with torch.no_grad():
+        si.linear.bias.fill_(0.5)
+    points = geometry(POINTS)
+    x = features(1)
+    rotation = utils.random_rotation_matrix(7)
+
+    before = si(apply_path(path, x, points))
+    after = si(apply_path(path, rotate(x, rotation), points @ rotation.T))
+
+    assert torch.allclose(after, before, atol=1e-5)
+
+
+def test_self_interaction_is_translation_invariant_through_a_filter():
+    """SelfInteraction 自己看不到座標，平移不變要接在濾波器後面才問得出來。"""
+    path = layers.filter_1_output_1(RBF_COUNT, output_dim=CHANNELS)
+    si = layers.SelfInteraction(CHANNELS, 3, bias=False)
+    points = geometry(POINTS)
+    x = features(1)
+    shift = torch.tensor([1.5, -2.0, 0.7])
+
+    before = si(apply_path(path, x, points))
+    after = si(apply_path(path, x, points + shift))
+
+    assert torch.allclose(after, before, atol=1e-5)
+
+
+# --------------------------------------------------------------------------
+# Nonlinearity：只動範數、不動方向
+# --------------------------------------------------------------------------
+
+
+def test_nonlinearity_on_scalars_is_the_bare_activation():
+    """L=0 直接套用非線性，不加 bias——與作者一致。"""
+    nl = layers.Nonlinearity(CHANNELS, angular_momentum=0)
+    x = features(0)
+    assert torch.allclose(nl(x), F.elu(x), atol=1e-6)
+
+
+def test_nonlinearity_on_scalars_has_no_parameters():
+    """L=0 那條沒有 bias，所以整個模組不該掛任何參數。
+
+    上游在這裡仍然建了一個 biases 變數卻沒用到；照抄會多出一顆死參數，
+    optimizer 還是會替它配狀態。
+    """
+    nl = layers.Nonlinearity(CHANNELS, angular_momentum=0)
+    assert list(nl.parameters()) == []
+
+
+def test_nonlinearity_defaults_to_elu_and_can_switch_to_ssp():
+    x = features(0)
+    assert torch.allclose(layers.Nonlinearity(CHANNELS, 0)(x), F.elu(x), atol=1e-6)
+    assert torch.allclose(
+        layers.Nonlinearity(CHANNELS, 0, nonlin=utils.ssp)(x), utils.ssp(x), atol=1e-6
+    )
+
+
+def test_nonlinearity_on_vectors_has_one_bias_per_channel():
+    """L>0 的 bias 加在範數上——那是個旋轉不變量，所以不破壞等變性。"""
+    nl = layers.Nonlinearity(CHANNELS, angular_momentum=1)
+    assert nl.bias is not None
+    assert nl.bias.shape == (CHANNELS,)
+    assert torch.equal(nl.bias, torch.zeros(CHANNELS))
+
+
+def test_nonlinearity_on_vectors_keeps_the_direction():
+    """只縮放範數、不改方向——方向一動就破壞等變性。"""
+    nl = layers.Nonlinearity(CHANNELS, angular_momentum=1)
+    x = features(1)
+    cosine = F.cosine_similarity(nl(x), x, dim=-1)
+    assert torch.allclose(cosine, torch.ones_like(cosine), atol=1e-5)
+
+
+def test_nonlinearity_on_vectors_actually_changes_the_norm():
+    """反面對照：確認上一條不是因為它根本沒動輸入而通過。"""
+    nl = layers.Nonlinearity(CHANNELS, angular_momentum=1, nonlin=utils.ssp)
+    x = features(1)
+    assert not torch.allclose(nl(x), x, atol=1e-3)
+
+
+def test_nonlinearity_rejects_input_of_the_wrong_L():
+    """建構時就綁定 L（bias 的形狀取決於它），餵錯要當場講。"""
+    nl = layers.Nonlinearity(CHANNELS, angular_momentum=1)
+    with pytest.raises(ValueError, match="angular_momentum"):
+        nl(features(0))
+
+
+def test_nonlinearity_on_vectors_is_rotation_equivariant():
+    """輸出與輸入平行、縮放倍率只看範數（旋轉不變量），所以整支跟著轉。"""
+    nl = layers.Nonlinearity(CHANNELS, angular_momentum=1)
+    x = features(1)
+    rotation = utils.random_rotation_matrix(7)
+    assert torch.allclose(nl(rotate(x, rotation)), rotate(nl(x), rotation), atol=1e-5)
+
+
+def test_nonlinearity_on_scalars_is_rotation_invariant():
+    """同 SelfInteraction 的 L=0 那條：要接在濾波器後面，旋轉才進得了式子。"""
+    path = layers.filter_1_output_0(RBF_COUNT, output_dim=CHANNELS)
+    nl = layers.Nonlinearity(CHANNELS, angular_momentum=0)
+    points = geometry(POINTS)
+    x = features(1)
+    rotation = utils.random_rotation_matrix(7)
+
+    before = nl(apply_path(path, x, points))
+    after = nl(apply_path(path, rotate(x, rotation), points @ rotation.T))
+
+    assert torch.allclose(after, before, atol=1e-5)
+
+
+def test_nonlinearity_is_translation_invariant_through_a_filter():
+    path = layers.filter_1_output_1(RBF_COUNT, output_dim=CHANNELS)
+    nl = layers.Nonlinearity(CHANNELS, angular_momentum=1)
+    points = geometry(POINTS)
+    x = features(1)
+    shift = torch.tensor([1.5, -2.0, 0.7])
+
+    before = nl(apply_path(path, x, points))
+    after = nl(apply_path(path, x, points + shift))
 
     assert torch.allclose(after, before, atol=1e-5)
