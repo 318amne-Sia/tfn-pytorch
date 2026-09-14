@@ -52,10 +52,13 @@ uv run ruff format .           # 格式化
 uv run pyright                 # 型別檢查
 ```
 
-`ruff`、`pyright`、`matplotlib` 都只在本機開發時用，不是執行期依賴，
-所以 Colab 那端的 `--no-deps` 安裝完全不受影響。
-（Colab 本來就預裝 matplotlib；它在 dev 這組，是為了讓 notebook 的畫圖程式碼
-能先在本機驗過再放進去。）
+`ruff`、`pyright`、`matplotlib`、`ipykernel` 都只在本機開發時用，不是執行期依賴，
+所以 Colab 那端的 `--no-deps` 安裝完全不受影響——Colab 本來就有 matplotlib 和 kernel。
+
+notebook 在本機跑的話：`uv sync` 之後在 VS Code 開 `notebooks/*.ipynb`，
+kernel 選這個 repo 的 `.venv`（右上角 Select Kernel → Python Environments → `.venv`）。
+本機跑的好處是改完程式碼馬上看得到，不用等 push；Colab 則是每張實驗票收尾時
+驗「整條管線在那邊也活著」的地方。
 
 它們抓的是**機械性翻譯錯誤**（API 簽名不合、殘留 import、`is` 比較字面值），
 不是數學錯誤——einsum 索引排錯或 CG 符號弄反，靜態工具一律看不見，

@@ -35,6 +35,9 @@ dev = [
     # notebook 的畫圖程式碼要能在本機先驗過再放進去。Colab 本來就預裝 matplotlib，
     # 所以它不該是執行期依賴——放這裡與 ruff / pyright 同一個位置。
     "matplotlib>=3.8",
+    # 讓 VS Code 能拿 .venv 當 notebook 的 kernel，在本機直接跑 notebooks/。
+    # Colab 那端自己有 kernel，同樣不需要這個。
+    "ipykernel>=6.29",
 ]
 
 [tool.pytest.ini_options]
