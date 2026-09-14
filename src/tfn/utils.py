@@ -179,3 +179,18 @@ def normalized_rmse(actual: Tensor, expected: Tensor) -> Tensor:
     if scale == 0:
         raise ValueError("參考曲線整條是 0，無法正規化")
     return torch.sqrt(torch.mean((actual - expected) ** 2)) / scale
+
+
+def l2_loss(x: Tensor) -> Tensor:
+    """``Σx² / 2``，對齊 TF1 的 ``tf.nn.l2_loss``。
+
+    刻意**不是** ``F.mse_loss``：那會再除以元素個數，梯度差一個常數倍，
+    等於偷偷改掉論文指定的學習率。以轉動慣量的 3×3 來說就差 9/2 = 4.5 倍。
+
+    重力那邊每一步的點數還會浮動（剔除近距離的點之後是 1–10），項數跟著
+    變，所以連「除以幾」都不是固定的——那代表每步的梯度量級本來就不一樣。
+    作者沒有正規化，靠 Adam 的二階動差去吸收。
+
+    那個 ÷2 沒有數學意義，只是讓微分之後不要跑出一個 2。
+    """
+    return 0.5 * torch.sum(x * x)

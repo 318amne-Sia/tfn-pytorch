@@ -11,7 +11,8 @@ TF 1.15 最高只支援 Python 3.7，macOS arm64 根本沒有 wheel，Colab 也�
 | 實驗 | 論文章節 | 狀態 |
 | --- | --- | --- |
 | shape classification（3D Tetris） | §5.1 | 完成——測試準確率 100% |
-| moment of inertia | §5.2 | 未開始 |
+| Newtonian gravity | §5.2 | 完成——徑向函數對 `−1/r²` 的 nRMSE 0.099 |
+| moment of inertia | §5.2 | 進行中 |
 | missing point（QM9） | §5.3 | 未開始 |
 
 ## 在 Colab 上用
@@ -45,14 +46,16 @@ Colab 的 pip 安裝不持久，換一台 VM 就沒了，所以這格每個 sess
 ```sh
 uv sync                        # 建 Python 3.12 環境（對齊 Colab 的 3.12.13）並安裝
 uv run pytest                  # 測試
-uv run pytest -m "not slow"    # 跳過訓練到收斂的那兩條（12 秒 -> 2 秒）
+uv run pytest -m "not slow"    # 跳過訓練到收斂的那幾條（13 秒 -> 2 秒）
 uv run ruff check .            # lint
 uv run ruff format .           # 格式化
 uv run pyright                 # 型別檢查
 ```
 
-`ruff` 與 `pyright` 只在本機開發時用，不是執行期依賴，
+`ruff`、`pyright`、`matplotlib` 都只在本機開發時用，不是執行期依賴，
 所以 Colab 那端的 `--no-deps` 安裝完全不受影響。
+（Colab 本來就預裝 matplotlib；它在 dev 這組，是為了讓 notebook 的畫圖程式碼
+能先在本機驗過再放進去。）
 
 它們抓的是**機械性翻譯錯誤**（API 簽名不合、殘留 import、`is` 比較字面值），
 不是數學錯誤——einsum 索引排錯或 CG 符號弄反，靜態工具一律看不見，

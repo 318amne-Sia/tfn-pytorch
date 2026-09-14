@@ -364,3 +364,22 @@ def test_normalized_rmse_rejects_an_all_zero_reference():
 def test_normalized_rmse_rejects_mismatched_shapes():
     with pytest.raises(ValueError):
         utils.normalized_rmse(torch.ones(3), torch.ones(4))
+
+
+# --------------------------------------------------------------------------
+# l2_loss
+# --------------------------------------------------------------------------
+
+
+def test_l2_loss_is_the_sum_of_squares_halved():
+    assert utils.l2_loss(torch.tensor([3.0, 4.0])).item() == pytest.approx(12.5)
+
+
+def test_l2_loss_is_not_the_mean_squared_error():
+    """照字面翻成 mse 會讓有效學習率差一個常數倍，而且不會報錯。
+
+    n 個元素時兩者差 n/2 倍——轉動慣量的 3×3 是 4.5 倍。
+    """
+    x = torch.tensor([3.0, 4.0, 0.0, 1.0])
+    mse = torch.mean(x * x)
+    assert utils.l2_loss(x).item() == pytest.approx(mse.item() * len(x) / 2)

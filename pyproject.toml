@@ -32,12 +32,15 @@ dev = [
     "pytest>=8",
     "ruff>=0.14",
     "pyright>=1.1.400",
+    # notebook 的畫圖程式碼要能在本機先驗過再放進去。Colab 本來就預裝 matplotlib，
+    # 所以它不該是執行期依賴——放這裡與 ruff / pyright 同一個位置。
+    "matplotlib>=3.8",
 ]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 # 預設會跑；要跳過最花時間的那兩條用 `uv run pytest -m "not slow"`
-markers = ["slow: 需要訓練到收斂，約 10 秒"]
+markers = ["slow: 需要訓練到收斂，整組約 11 秒"]
 # 打錯的 marker 只會發 warning，然後靜靜地不被 -m 篩選到；strict 讓它直接失敗
 addopts = "--strict-markers"
 
