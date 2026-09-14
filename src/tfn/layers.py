@@ -30,6 +30,8 @@ __all__ = [
     "F_0",
     "F_1",
     "unit_vectors",
+    "Y_2",
+    "matrix_from_0_2",
     "filter_0",
     "filter_1_output_0",
     "filter_1_output_1",
@@ -80,6 +82,88 @@ def unit_vectors(v: Tensor, dim: int = -1) -> Tensor:
     ``0 / 1e-4 = 0`` 而不是 NaN。
     """
     return v / norm_with_epsilon(v, dim=dim, keepdim=True)
+
+
+def Y_2(rij: Tensor) -> Tensor:
+    """二階實球諧，L=2 濾波器的角度部分。``[..., 3] -> [..., 5]``
+
+    L=1 的角度部分是單位向量（:func:`unit_vectors`），L=2 的是這五個分量。
+    順序與係數照上游：``xy``、``yz``、``z²``、``zx``、``x²−y²``。
+
+    全部除以 ``r²``，所以這支是**零次齊次**的——只看方向，不看長度。長度那半
+    是徑向函數的工作，兩者在濾波器裡相乘。
+
+    ``r²`` 夾在 ``EPSILON`` 以上：重合的兩點沒有方向可言，分子同時是 0，於是
+    回傳 0 而不是 NaN。
+
+    這五個係數與 :func:`matrix_from_0_2` 的係數是一組的，改一邊就得改另一邊——
+    兩者合起來的封閉形式（見 :func:`matrix_from_0_2`）就是釘死它們的東西。
+    """
+    x, y, z = rij.unbind(dim=-1)
+    r2 = torch.clamp(torch.sum(rij * rij, dim=-1), min=EPSILON)
+    return torch.stack(
+        [
+            x * y / r2,
+            y * z / r2,
+            (-x * x - y * y + 2.0 * z * z) / (2.0 * math.sqrt(3.0) * r2),
+            z * x / r2,
+            (x * x - y * y) / (2.0 * r2),
+        ],
+        dim=-1,
+    )
+
+
+def matrix_from_0_2(scalar: Tensor, l2: Tensor) -> Tensor:
+    """把「1 個純量 + 5 個 L=2 分量」拼成 3×3 對稱矩陣。``([...], [..., 5]) -> [..., 3, 3]``
+
+    這不是一層網路，是**換個寫法**：同樣 6 個數字，從「旋轉規則最單純」的基底
+    換到「人看得懂」的基底。裡面沒有任何參數，來回換算是可逆的。
+
+    一個 3×3 矩陣的 9 個數字在旋轉之下不是一體的——它們分成 1（trace）、
+    3（反對稱）、5（無 trace 的對稱部分）三堆，每一堆只跟自己人混。對稱矩陣
+    的反對稱那 3 個恆為 0，所以剩下 1 + 5，正好就是這支的兩個輸入。
+
+    網路內部必須用 1 + 5 這種寫法，等變性才推得動：任意權重把「旋轉時不動的」
+    和「旋轉時會轉的」加在一起，結果哪一條規則都不遵守。所以這一步不能是可學
+    的全連接層，只能是這個固定的換算。
+
+    三件事值得分開看：
+
+    - **三個非對角線直接取用**，各只寫一次、上下三角共用，所以對稱是結構保證的
+    - **純量等量加到三個對角線**，也就是加上 ``scalar`` 倍的單位矩陣
+    - **剩下兩個分量負責三個對角線之間的高低差**。只需要兩個，是因為三者的
+      總和已經被純量決定了
+
+    後面這點可以驗算：``d_z2`` 的三個係數是 ``−1/√3, −1/√3, +2/√3``、``d_x2y2``
+    的是 ``+1, −1, 0``，兩組都加起來是 0。所以 ``trace(M) = 3·scalar`` 恆成立，
+    L=2 那五個數字對 trace 完全沒有影響力。
+
+    與 :func:`Y_2` 合起來有一個封閉形式，測試拿它把兩邊的係數一次釘死::
+
+        matrix_from_0_2(0, Y_2(r)) == r̂ r̂ᵀ − I/3
+    """
+    if l2.shape[-1] != 5:
+        raise ValueError(f"L=2 特徵的最後一軸要是 5，收到 {l2.shape[-1]}")
+    if scalar.shape != l2.shape[:-1]:
+        raise ValueError(
+            f"純量與 L=2 特徵的前置形狀不符：{tuple(scalar.shape)} 與 {tuple(l2.shape[:-1])}"
+        )
+
+    d_xy, d_yz, d_z2, d_zx, d_x2y2 = l2.unbind(dim=-1)
+    inv_sqrt3 = 1.0 / math.sqrt(3.0)
+
+    mxx = -d_z2 * inv_sqrt3 + d_x2y2 + scalar
+    myy = -d_z2 * inv_sqrt3 - d_x2y2 + scalar
+    mzz = 2.0 * d_z2 * inv_sqrt3 + scalar
+
+    return torch.stack(
+        [
+            torch.stack([mxx, d_xy, d_zx], dim=-1),
+            torch.stack([d_xy, myy, d_yz], dim=-1),
+            torch.stack([d_zx, d_yz, mzz], dim=-1),
+        ],
+        dim=-2,
+    )
 
 
 class R(nn.Module):

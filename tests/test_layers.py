@@ -192,6 +192,148 @@ def test_probe_radial_does_not_track_gradients():
 
 
 # --------------------------------------------------------------------------
+# Y_2 與 matrix_from_0_2：L=2 的角度部分與矩陣拼裝
+# --------------------------------------------------------------------------
+#
+# 這兩個函式沒有任何參數，全部是固定常數，而且合起來有一個封閉形式：
+#
+#     matrix_from_0_2(0, Y_2(r)) == r̂ r̂ᵀ − I/3
+#
+# 係數寫錯不會讓 loss 變難看、也不會讓曲線變得不像曲線，只會讓它安靜地偏掉。
+# 訓練抓不到、靜態工具抓不到、連等變性測試都抓不到（錯的係數照樣可能等變），
+# 只有這條恆等式抓得到。對照物 r̂r̂ᵀ − I/3 是三行程式，寫不錯。
+#
+# 也因為有它，這裡**不需要 L=2 的 Wigner D 矩陣**：等變性是這條恆等式的直接
+# 推論（r̂r̂ᵀ − I/3 顯然滿足 R M Rᵀ）。自己寫一個 5×5 的 Wigner D 只是引入
+# 第二個同樣容易寫錯、卻沒有獨立對照來源的東西。
+
+# 高精度那組把恆等式釘到機器精度；float32 那組確認執行期的實際 dtype 也成立。
+EXACT_DTYPES = [(torch.float64, 1e-12), (torch.float32, 1e-6)]
+
+
+def directions(n: int = 200, seed: int = 0) -> torch.Tensor:
+    g = torch.Generator().manual_seed(seed)
+    return torch.randn(n, 3, generator=g, dtype=torch.float64)
+
+
+def test_Y_2_has_five_components():
+    assert layers.Y_2(directions(7)).shape == (7, 5)
+
+
+def test_Y_2_keeps_leading_axes():
+    """上游只餵 [N, N, 3]，但票 11 的濾波器也是這個形狀，別綁死成 2 軸。"""
+    assert layers.Y_2(torch.randn(4, 6, 3)).shape == (4, 6, 5)
+
+
+def test_Y_2_matches_the_upstream_coefficients():
+    """逐個數字對上游 layers.Y_2。順序是 xy, yz, z², zx, x²−y²。
+
+    r = (1, 2, 3)、r² = 14：
+      xy/r²                    = 2/14
+      yz/r²                    = 6/14
+      (−x²−y²+2z²)/(2√3·r²)    = 13/(2√3·14)
+      zx/r²                    = 3/14
+      (x²−y²)/(2r²)            = −3/28
+    """
+    out = layers.Y_2(torch.tensor([1.0, 2.0, 3.0], dtype=torch.float64))
+    assert out.tolist() == pytest.approx(
+        [2 / 14, 6 / 14, 13 / (2 * math.sqrt(3) * 14), 3 / 14, -3 / 28]
+    )
+
+
+def test_Y_2_only_depends_on_direction():
+    """二階球諧是零次齊次的：整體縮放距離不改變角度部分。
+
+    這條同時擋住「忘記除以 r²」——那會讓輸出隨長度平方放大。
+    """
+    r = directions(50)
+    assert torch.allclose(layers.Y_2(r * 7.5), layers.Y_2(r), atol=1e-12, rtol=0)
+
+
+def test_Y_2_is_zero_at_the_origin_without_nan():
+    """重合的兩點沒有方向可言。r² 被夾在 EPSILON 以上，所以是 0 不是 NaN。"""
+    out = layers.Y_2(torch.zeros(3))
+    assert torch.equal(out, torch.zeros(5))
+
+
+def test_matrix_from_0_2_is_symmetric():
+    """三個非對角線各只寫一次、上下三角共用，所以對稱是結構保證的。"""
+    built = layers.matrix_from_0_2(torch.randn(20), torch.randn(20, 5))
+    assert torch.equal(built, built.transpose(-2, -1))
+
+
+def test_matrix_from_0_2_keeps_leading_axes():
+    """票 12 的網路輸出帶一根通道軸，不要逼呼叫端先攤平。"""
+    assert layers.matrix_from_0_2(torch.randn(4, 2), torch.randn(4, 2, 5)).shape == (4, 2, 3, 3)
+
+
+def test_matrix_from_0_2_rejects_a_wrong_component_count():
+    with pytest.raises(ValueError):
+        layers.matrix_from_0_2(torch.randn(4), torch.randn(4, 3))
+
+
+def test_matrix_from_0_2_rejects_mismatched_leading_shapes():
+    """最典型的誤用：L=2 那半忘了 squeeze 掉通道軸。"""
+    with pytest.raises(ValueError):
+        layers.matrix_from_0_2(torch.randn(4), torch.randn(4, 1, 5))
+
+
+def test_matrix_from_0_2_trace_comes_only_from_the_scalar():
+    """恆等式二：trace 恆等於 3s，與 L=2 那五個數字完全無關。
+
+    這正是「1 + 5」這個拆法成立的前提——L=2 那半必須對 trace 沒有影響力，
+    否則兩半就不是各自獨立的表示。d 取隨機值，所以它證的是「對任何 d」。
+    """
+    g = torch.Generator().manual_seed(1)
+    scalar = torch.randn(200, generator=g, dtype=torch.float64)
+    l2 = torch.randn(200, 5, generator=g, dtype=torch.float64)
+    traces = layers.matrix_from_0_2(scalar, l2).diagonal(dim1=-2, dim2=-1).sum(-1)
+    assert torch.allclose(traces, 3.0 * scalar, atol=1e-12, rtol=0)
+
+
+@pytest.mark.parametrize(("dtype", "tolerance"), EXACT_DTYPES)
+def test_matrix_from_0_2_of_Y_2_is_the_traceless_outer_product(dtype, tolerance):
+    """恆等式一，本票的核心關卡。
+
+    把純量設成 0、餵進某個方向的二階球諧，拼出來的矩陣精確等於
+    ``r̂ r̂ᵀ − I/3``——也就是「這個方向的外積，扣掉 trace」。
+
+    Y_2 的五個係數與 matrix_from_0_2 的每個 1/√3 只要有一個寫錯，這條就紅。
+    容忍度刻意開得很緊（float64 到 1e-12）：放鬆它等於放棄這一票最大的價值。
+    """
+    r = directions().to(dtype)
+    built = layers.matrix_from_0_2(torch.zeros(len(r), dtype=dtype), layers.Y_2(r))
+
+    unit = r / torch.linalg.vector_norm(r, dim=-1, keepdim=True)
+    expected = unit.unsqueeze(-1) * unit.unsqueeze(-2) - torch.eye(3, dtype=dtype) / 3
+
+    assert torch.allclose(built, expected, atol=tolerance, rtol=0)
+
+
+def test_matrix_from_0_2_of_Y_2_rotates_as_a_matrix():
+    """L=2 的等變性，測在拼好的 3×3 上：``M' = R M Rᵀ``。
+
+    這就是不寫 Wigner D 的原因——同一件事，用大家都會的形式表達。
+    """
+    r = directions(100)
+    rotation = utils.random_rotation_matrix(3, dtype=torch.float64)
+    zeros = torch.zeros(len(r), dtype=torch.float64)
+
+    before = layers.matrix_from_0_2(zeros, layers.Y_2(r))
+    after = layers.matrix_from_0_2(zeros, layers.Y_2(r @ rotation.T))
+
+    assert torch.allclose(after, rotation @ before @ rotation.T, atol=1e-12, rtol=0)
+
+
+def test_matrix_from_0_2_scalar_part_is_a_multiple_of_the_identity():
+    """純量那半只會等量加到三個對角線上——它管的是「整體大小」。"""
+    l2 = torch.zeros(6, 5, dtype=torch.float64)
+    scalar = torch.randn(6, dtype=torch.float64)
+    built = layers.matrix_from_0_2(scalar, l2)
+    assert torch.allclose(built, scalar[:, None, None] * torch.eye(3, dtype=torch.float64))
+
+
+# --------------------------------------------------------------------------
 # F_0：L = 0 濾波器
 # --------------------------------------------------------------------------
 
