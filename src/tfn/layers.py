@@ -29,12 +29,14 @@ __all__ = [
     "probe_radial",
     "F_0",
     "F_1",
+    "F_2",
     "unit_vectors",
     "Y_2",
     "matrix_from_0_2",
     "filter_0",
     "filter_1_output_0",
     "filter_1_output_1",
+    "filter_2_output_2",
     "SelfInteraction",
     "Nonlinearity",
     "Convolution",
@@ -82,6 +84,28 @@ def unit_vectors(v: Tensor, dim: int = -1) -> Tensor:
     ``0 / 1e-4 = 0`` 而不是 NaN。
     """
     return v / norm_with_epsilon(v, dim=dim, keepdim=True)
+
+
+def _masked_radial(radial: Tensor, rij: Tensor) -> Tensor:
+    """把重合點對的徑向權重歸零。``([N, N, C], [N, N, 3]) -> [N, N, C]``
+
+    ``rij = 0`` 的點對（``i = j``，或兩個點恰好重合）沒有方向可言，角度部分
+    對它們沒有定義，所以整條貢獻要遮掉。L>0 的濾波器都要走這一步。
+
+    這裡刻意用**未正則化**的 ``vector_norm``，不是 :func:`~tfn.utils.distance_matrix`：
+    後者走 ``norm_with_epsilon``，對角線是 1e-4，拿去比 ``< EPSILON``（1e-8）
+    永遠為假，遮罩會靜靜地失效。上游此處用的也是未正則化的 ``tf.norm``。
+
+    遮罩擋掉的其實是**梯度**而不是數值：角度部分在 ``rij = 0`` 已經回 0，沒有
+    遮罩輸出也是 0；但反向時那裡的 Jacobian 是 ``1/sqrt(EPSILON)`` = 1e4，會把
+    一個純屬正則化假象的巨大梯度灌回座標。
+
+    抽成共用函式而不是在每個濾波器裡各寫一次：這段推理只要有一處寫歪（例如
+    改用了正則化的距離），那個濾波器就會安靜地多出一條自我項，而且不會有任何
+    測試以外的徵兆。
+    """
+    dij = torch.linalg.vector_norm(rij, dim=-1)
+    return torch.where((dij < EPSILON).unsqueeze(-1), 0.0, radial)
 
 
 def Y_2(rij: Tensor) -> Tensor:
@@ -273,23 +297,39 @@ class F_1(nn.Module):
         )
 
     def forward(self, rbf: Tensor, rij: Tensor) -> Tensor:
-        # [N, N, output_dim]
-        radial = self.radial(rbf)
-
-        # rij = 0 的點對（i = j，或兩個點恰好重合）沒有方向可言，遮掉。
-        #
-        # 這裡刻意用未正則化的 vector_norm，不是 utils.distance_matrix：後者走
-        # norm_with_epsilon，對角線是 1e-4，拿去比 `< EPSILON`（1e-8）永遠為假，
-        # 遮罩會靜靜地失效。上游此處用的也是未正則化的 tf.norm。
-        #
-        # 遮罩擋掉的其實是梯度而不是數值：unit_vectors 在 rij = 0 已經回 0，
-        # 沒有遮罩輸出也是 0；但反向時那裡的 Jacobian 是 1/sqrt(EPSILON) = 1e4，
-        # 會把一個純屬正則化假象的巨大梯度灌回座標。
-        dij = torch.linalg.vector_norm(rij, dim=-1)
-        masked_radial = torch.where((dij < EPSILON).unsqueeze(-1), 0.0, radial)
-
         # [N, N, 1, 3] * [N, N, output_dim, 1] -> [N, N, output_dim, 3]
-        return unit_vectors(rij).unsqueeze(-2) * masked_radial.unsqueeze(-1)
+        return unit_vectors(rij).unsqueeze(-2) * _masked_radial(self.radial(rbf), rij).unsqueeze(-1)
+
+
+class F_2(nn.Module):
+    """L = 2 濾波器。``([N, N, input_dim], [N, N, 3]) -> [N, N, output_dim, 5]``
+
+    跟 :class:`F_1` 只差角度部分：那裡是單位向量（1 階球諧），這裡是
+    :func:`Y_2`（2 階球諧的五個分量）。徑向部分與遮罩完全共用。
+
+    實驗一用不到這一支；它是轉動慣量那個任務唯一需要的新等變性零件。
+    """
+
+    def __init__(
+        self,
+        input_dim: int,
+        output_dim: int = 1,
+        hidden_dim: int | None = None,
+        nonlin: Callable[[Tensor], Tensor] = F.relu,
+        bias_init: BiasInit = "zeros",
+    ) -> None:
+        super().__init__()
+        self.radial = R(
+            input_dim,
+            output_dim=output_dim,
+            hidden_dim=hidden_dim,
+            nonlin=nonlin,
+            bias_init=bias_init,
+        )
+
+    def forward(self, rbf: Tensor, rij: Tensor) -> Tensor:
+        # [N, N, 1, 5] * [N, N, output_dim, 1] -> [N, N, output_dim, 5]
+        return Y_2(rij).unsqueeze(-2) * _masked_radial(self.radial(rbf), rij).unsqueeze(-1)
 
 
 # --------------------------------------------------------------------------
@@ -432,6 +472,45 @@ class filter_1_output_1(nn.Module):
             cg = get_eijk(device=layer_input.device, dtype=layer_input.dtype)
         else:
             raise NotImplementedError(f"L > 1 尚未移植（輸入的最後一軸為 {dim}）")
+        return _contract(cg, filter_out, layer_input)
+
+
+class filter_2_output_2(nn.Module):
+    """0 × 2 → 2。``([N, C, 1], [N, N, input_dim], [N, N, 3]) -> [N, C, 5]``
+
+    輸入是 L=0 時，耦合規則 ``|L_f − L_in| ≤ L_out ≤ L_f + L_in`` 塌成
+    ``L_out = L_f``，CG 就是單位矩陣——純量只縮放濾波器，五個分量原封不動。
+    所以這條路徑的「收縮」實際上什麼都沒做，就是沿著鄰居加權求和。
+
+    只實作 L=0 輸入，同上游。L=1 的輸入配 L=2 的濾波器會同時耦合出 L=1、2、3，
+    那不是一條路徑表示得了的東西。
+    """
+
+    def __init__(
+        self,
+        input_dim: int,
+        output_dim: int = 1,
+        hidden_dim: int | None = None,
+        nonlin: Callable[[Tensor], Tensor] = F.relu,
+        bias_init: BiasInit = "zeros",
+    ) -> None:
+        super().__init__()
+        self.filter = F_2(
+            input_dim,
+            output_dim=output_dim,
+            hidden_dim=hidden_dim,
+            nonlin=nonlin,
+            bias_init=bias_init,
+        )
+
+    def forward(self, layer_input: Tensor, rbf: Tensor, rij: Tensor) -> Tensor:
+        # [N, N, C, 5]
+        filter_out = self.filter(rbf, rij)
+        dim = layer_input.shape[-1]
+        if dim != 1:
+            raise NotImplementedError(f"0 × 2 → 2 之外的組合尚未移植（輸入的最後一軸為 {dim}）")
+        # [5, 5, 1]：中間是濾波器的角度軸，最後是輸入的——L=0 所以長度 1
+        cg = torch.eye(5, device=layer_input.device, dtype=layer_input.dtype).unsqueeze(-1)
         return _contract(cg, filter_out, layer_input)
 
 

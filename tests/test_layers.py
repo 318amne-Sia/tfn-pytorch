@@ -467,6 +467,57 @@ def test_F_1_is_translation_invariant():
 
 
 # --------------------------------------------------------------------------
+# F_2：L = 2 濾波器
+# --------------------------------------------------------------------------
+
+
+def test_F_2_has_five_trailing_components():
+    f2 = layers.F_2(RBF_COUNT, output_dim=CHANNELS)
+    points = geometry(POINTS)
+    out = f2(rbf_expansion(points), utils.difference_matrix(points))
+    assert out.shape == (POINTS, POINTS, CHANNELS, 5)
+
+
+def test_F_2_is_the_radial_part_times_Y_2():
+    """F_2 = R(距離) × Y_2(方向)，就這樣。
+
+    拿模組自己的 R 逐元素對，所以這條釘的是**兩根軸有沒有擺對**——把兩個
+    unsqueeze 寫反會得到形狀一樣、數值全錯的東西。
+    """
+    torch.manual_seed(0)
+    f2 = layers.F_2(RBF_COUNT, output_dim=CHANNELS)
+    points = geometry(POINTS)
+    rbf, rij = rbf_expansion(points), utils.difference_matrix(points)
+
+    expected = layers.Y_2(rij).unsqueeze(-2) * f2.radial(rbf).unsqueeze(-1)
+    off_diagonal = ~torch.eye(POINTS, dtype=torch.bool)
+    assert torch.allclose(f2(rbf, rij)[off_diagonal], expected[off_diagonal], atol=1e-6)
+
+
+def test_F_2_is_zero_on_the_diagonal():
+    """點對自己沒有方向可言，整條貢獻要被遮掉。"""
+    f2 = layers.F_2(RBF_COUNT, output_dim=CHANNELS)
+    points = geometry(POINTS)
+    out = f2(rbf_expansion(points), utils.difference_matrix(points))
+    diagonal = out[range(POINTS), range(POINTS)]
+    assert torch.equal(diagonal, torch.zeros_like(diagonal))
+
+
+def test_F_2_mask_uses_an_unregularised_distance():
+    """遮罩要真的擋掉重合的點，不只是對角線。
+
+    改用 utils.distance_matrix 的話對角線是 1e-4、永遠比不過 EPSILON，這條會紅——
+    而且那種失效不會有任何其他徵兆。
+    """
+    f2 = layers.F_2(RBF_COUNT, output_dim=CHANNELS)
+    points = geometry(POINTS)
+    points[2] = points[0]
+    out = f2(rbf_expansion(points), utils.difference_matrix(points))
+    assert torch.equal(out[0, 2], torch.zeros_like(out[0, 2]))
+    assert torch.equal(out[2, 0], torch.zeros_like(out[2, 0]))
+
+
+# --------------------------------------------------------------------------
 # CG 收縮：三條濾波路徑
 # --------------------------------------------------------------------------
 
@@ -481,6 +532,7 @@ PATHS = [
     ("filter_1_output_0 : L=1 -> L=0", layers.filter_1_output_0, 1, 0),
     ("filter_1_output_1 : L=0 -> L=1", layers.filter_1_output_1, 0, 1),
     ("filter_1_output_1 : L=1 -> L=1", layers.filter_1_output_1, 1, 1),
+    ("filter_2_output_2 : L=0 -> L=2", layers.filter_2_output_2, 0, 2),
 ]
 PATH_IDS = [path[0] for path in PATHS]
 
@@ -502,6 +554,30 @@ def apply_path(path: torch.nn.Module, layer_input: torch.Tensor, points: torch.T
 def rotate(t: torch.Tensor, rotation: torch.Tensor) -> torch.Tensor:
     """把最後一軸長度 3 的張量整批旋轉。"""
     return t @ rotation.T
+
+
+def as_comparable(t: torch.Tensor, angular_momentum: int) -> torch.Tensor:
+    """把路徑輸出轉成「有現成比較形式」的樣子。L=2 拼成 3×3，其餘原樣。
+
+    L=0 旋轉下不動、L=1 直接轉，兩者都有一行就能寫出來的變換規則。L=2 的五個
+    分量要直接比，就得先知道它們在旋轉下怎麼混——也就是 5×5 的 Wigner D 矩陣。
+
+    繞過那個東西的辦法是先拼成矩陣：經過 matrix_from_0_2 之後，L=2 的變換規則
+    就退化成大家都會的 R M Rᵀ，而且順帶把 Y_2 與 matrix_from_0_2 的係數一起
+    帶進這條測試（票 10 已經把它們釘死在一個封閉形式上）。
+    """
+    if angular_momentum != 2:
+        return t
+    return layers.matrix_from_0_2(torch.zeros(t.shape[:-1]), t)
+
+
+def rotate_output(t: torch.Tensor, rotation: torch.Tensor, angular_momentum: int):
+    """把 as_comparable 過的輸出依它自己的 L 變換。"""
+    if angular_momentum == 0:
+        return t
+    if angular_momentum == 1:
+        return rotate(t, rotation)
+    return rotation @ t @ rotation.T
 
 
 # --- 形狀與契約 -----------------------------------------------------------
@@ -546,6 +622,56 @@ def test_L_1_filters_reject_unsupported_angular_momenta(cls):
     path = cls(RBF_COUNT, output_dim=CHANNELS)
     with pytest.raises(NotImplementedError):
         apply_path(path, features(2), geometry(POINTS))
+
+
+def test_filter_2_output_2_yields_five_components():
+    path = layers.filter_2_output_2(RBF_COUNT, output_dim=CHANNELS)
+    out = apply_path(path, features(0), geometry(POINTS))
+    assert out.shape == (POINTS, CHANNELS, 5)
+
+
+def test_filter_2_output_2_rejects_non_scalar_input():
+    """0 ⊗ 2 → 2 是上游唯一實作的組合。
+
+    L=1 的輸入配 L=2 的濾波器會耦合出 L=1、2、3 三種輸出，不是一條路徑就能
+    表示的東西——所以明確拋錯，而不是算出一個看起來合理的結果。
+    """
+    path = layers.filter_2_output_2(RBF_COUNT, output_dim=CHANNELS)
+    with pytest.raises(NotImplementedError):
+        apply_path(path, features(1), geometry(POINTS))
+
+
+def test_filter_2_output_2_contraction_is_a_scalar_rescale():
+    """CG 是 eye(5)：純量輸入只縮放濾波器，五個分量原封不動搬出來。
+
+    輸入 L=0 時耦合規則塌成「輸出的 L 等於濾波器的 L」，所以收縮那一步實際上
+    什麼都沒做，就是沿鄰居加權求和。
+    """
+    torch.manual_seed(0)
+    path = layers.filter_2_output_2(RBF_COUNT, output_dim=CHANNELS)
+    points = geometry(POINTS)
+    x = features(0)
+    rbf, rij = rbf_expansion(points), utils.difference_matrix(points)
+
+    # [N, N, C, 5] 的濾波器，用每個鄰居的純量加權後對鄰居求和
+    expected = (path.filter(rbf, rij) * x.squeeze(-1)[None, :, :, None]).sum(dim=1)
+    assert torch.allclose(path(x, rbf, rij), expected, atol=1e-6)
+
+
+def test_filter_2_output_2_ignores_a_coincident_neighbour():
+    """座標重合的鄰居不該有任何影響——改它的特徵，輸出不動。"""
+    torch.manual_seed(0)
+    path = layers.filter_2_output_2(RBF_COUNT, output_dim=CHANNELS)
+    points = geometry(POINTS)
+    points[1] = points[0]
+
+    x = features(0)
+    louder = x.clone()
+    louder[1] *= 5.0
+
+    before = apply_path(path, x, points)
+    after = apply_path(path, louder, points)
+    assert torch.allclose(before[0], after[0], atol=1e-6)
 
 
 def test_filter_0_works_for_any_angular_momentum():
@@ -657,8 +783,8 @@ def test_path_is_rotation_equivariant(name, cls, l_in, l_out):
     rotated_x = rotate(x, rotation) if l_in == 1 else x
     after = apply_path(path, rotated_x, points @ rotation.T)
 
-    expected = rotate(before, rotation) if l_out == 1 else before
-    assert torch.allclose(after, expected, atol=1e-5)
+    expected = rotate_output(as_comparable(before, l_out), rotation, l_out)
+    assert torch.allclose(as_comparable(after, l_out), expected, atol=1e-5)
 
 
 @pytest.mark.parametrize(("name", "cls", "l_in", "l_out"), PATHS, ids=PATH_IDS)
