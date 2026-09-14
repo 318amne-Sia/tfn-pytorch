@@ -156,3 +156,26 @@ def random_rotation_matrix(
     axis = axis / (np.linalg.norm(axis) + EPSILON)
     theta = 2.0 * math.pi * generator.uniform(0.0, 1.0)
     return rotation_matrix(axis, theta, device=device, dtype=dtype)
+
+
+def normalized_rmse(actual: Tensor, expected: Tensor) -> Tensor:
+    """相對於參考曲線量級的 RMSE：``RMS(actual − expected) / RMS(expected)``。
+
+    實驗二的驗收指標。論文 §5.2 的成果不是一個準確率而是一張圖——學到的
+    徑向函數要疊得上解析解——這支把「疊得上」壓成一個可以拿去比門檻的數字。
+
+    為什麼取比值而不是絕對 RMSE：三條待驗收的曲線量級差很多（``2/3·r²``
+    在 1 以下、``−1/r²`` 在近距離到 −4），比值才能共用同一種門檻寫法。
+
+    為什麼不逐點相除：``2/3·r²`` 在近距離趨近 0、``−1/r²`` 在近距離發散，
+    逐點相對誤差在區間兩端都會失控。先各自取 RMS 再相除沒有這個問題。
+
+    整條曲線符號反轉會得到 2.0——那正是 CG 係數或 Levi-Civita 弄反的典型
+    症狀（形狀全對、只差一個負號，loss 照樣降），任何合理的門檻都擋得住。
+    """
+    if actual.shape != expected.shape:
+        raise ValueError(f"形狀不一致：{tuple(actual.shape)} 與 {tuple(expected.shape)}")
+    scale = torch.sqrt(torch.mean(expected * expected))
+    if scale == 0:
+        raise ValueError("參考曲線整條是 0，無法正規化")
+    return torch.sqrt(torch.mean((actual - expected) ** 2)) / scale

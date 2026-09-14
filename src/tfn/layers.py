@@ -13,17 +13,20 @@ PyTorch 的參數屬於物件，所以 R / F_0 / F_1 都是 nn.Module，建構�
 輸入維度。
 """
 
+import math
 from collections.abc import Callable
-from typing import NamedTuple, cast
+from typing import Literal, NamedTuple, cast
 
 import torch
 from torch import Tensor, nn
 from torch.nn import functional as F
 
-from tfn.utils import EPSILON, get_eijk, norm_with_epsilon
+from tfn.utils import EPSILON, get_eijk, norm_with_epsilon, rbf_expansion
 
 __all__ = [
+    "BiasInit",
     "R",
+    "probe_radial",
     "F_0",
     "F_1",
     "unit_vectors",
@@ -39,6 +42,35 @@ __all__ = [
     "NonlinearityStep",
     "Layer",
 ]
+
+
+BiasInit = Literal["zeros", "glorot"]
+
+
+def _init_bias_(bias: Tensor, bias_init: BiasInit) -> None:
+    """就地初始化一顆 1-D bias。
+
+    ``"zeros"`` 是作者在形狀分類與轉動慣量兩份 notebook 的作法（TF1 的
+    ``constant_initializer(0.)``）；``"glorot"`` 是重力那份 notebook 明確
+    傳進去的 ``glorot_uniform_initializer``。權重兩邊都是 glorot，唯一的
+    差別就是 bias，所以只有這一顆需要選項。
+
+    TF1 的 ``_compute_fans`` 對 1-D 張量取 ``fan_in = fan_out = shape[0]``，
+    界是 ``sqrt(6 / 2n)``——所以同一個 R 裡兩顆 bias 的界並不一樣寬：
+    ``hidden_dim = 30`` 時 ``b1`` 是 ±0.316，``output_dim = 1`` 時 ``b2``
+    是 ±1.732。後者直接加在徑向函數的輸出上，量級不小。
+
+    不能直接借用 ``nn.init.xavier_uniform_``：它對維度少於 2 的張量會拋
+    ValueError，界必須自己算。
+    """
+    if bias_init == "zeros":
+        nn.init.zeros_(bias)
+    elif bias_init == "glorot":
+        fan = bias.shape[0]
+        limit = math.sqrt(6.0 / (fan + fan))
+        nn.init.uniform_(bias, -limit, limit)
+    else:
+        raise ValueError(f"未知的 bias_init：{bias_init!r}（可選 'zeros' 或 'glorot'）")
 
 
 def unit_vectors(v: Tensor, dim: int = -1) -> Tensor:
@@ -66,6 +98,7 @@ class R(nn.Module):
         output_dim: int = 1,
         hidden_dim: int | None = None,
         nonlin: Callable[[Tensor], Tensor] = F.relu,
+        bias_init: BiasInit = "zeros",
     ) -> None:
         super().__init__()
         if hidden_dim is None:
@@ -75,14 +108,32 @@ class R(nn.Module):
         self.linear1 = nn.Linear(input_dim, hidden_dim)
         self.linear2 = nn.Linear(hidden_dim, output_dim)
         for linear in (self.linear1, self.linear2):
-            # 明確對齊作者的 xavier_initializer / constant_initializer(0.)。
-            # nn.Linear 預設是 Kaiming uniform（界窄 sqrt(3) 倍）加上均勻亂數
-            # bias，沿用預設等於偷偷換掉了初始化。
+            # 明確對齊作者的 xavier_initializer。nn.Linear 預設是 Kaiming
+            # uniform（界窄 sqrt(3) 倍）加上均勻亂數 bias，沿用預設等於偷偷
+            # 換掉了初始化。bias 的兩種作法見 _init_bias_。
             nn.init.xavier_uniform_(linear.weight)
-            nn.init.zeros_(linear.bias)
+            _init_bias_(linear.bias, bias_init)
 
     def forward(self, rbf: Tensor) -> Tensor:
         return self.linear2(self.nonlin(self.linear1(rbf)))
+
+
+def probe_radial(radial: R, distances: Tensor, *, low: float, high: float, count: int) -> Tensor:
+    """把訓練好的徑向函數攤開成一條曲線。``[M] -> [M, output_dim]``
+
+    論文 §5.2 的成果不是準確率而是一張圖：那兩個實驗的網路小到只剩幾條
+    徑向函數可學，所以可以整條畫出來跟解析解逐點對照。這支負責取樣。
+
+    它不是第二套實作——就是 :func:`~tfn.utils.rbf_expansion` 接著 ``radial``。
+    存在的意義只是把 RBF 設定收在一處：畫圖的程式碼與訓練的程式碼各自展開
+    一次的話，兩邊的 low / high / count 很容易不知不覺寫得不一樣，而那種錯
+    會讓曲線整條平移、看起來卻還是一條合理的曲線。
+
+    回傳值不帶梯度（它是拿來看的，不在訓練路徑上），通道軸保留不 squeeze，
+    單通道的呼叫端自己取 ``[..., 0]``。
+    """
+    with torch.no_grad():
+        return radial(rbf_expansion(distances, low=low, high=high, count=count))
 
 
 class F_0(nn.Module):
@@ -98,9 +149,16 @@ class F_0(nn.Module):
         output_dim: int = 1,
         hidden_dim: int | None = None,
         nonlin: Callable[[Tensor], Tensor] = F.relu,
+        bias_init: BiasInit = "zeros",
     ) -> None:
         super().__init__()
-        self.radial = R(input_dim, output_dim=output_dim, hidden_dim=hidden_dim, nonlin=nonlin)
+        self.radial = R(
+            input_dim,
+            output_dim=output_dim,
+            hidden_dim=hidden_dim,
+            nonlin=nonlin,
+            bias_init=bias_init,
+        )
 
     def forward(self, rbf: Tensor) -> Tensor:
         return self.radial(rbf).unsqueeze(-1)
@@ -119,9 +177,16 @@ class F_1(nn.Module):
         output_dim: int = 1,
         hidden_dim: int | None = None,
         nonlin: Callable[[Tensor], Tensor] = F.relu,
+        bias_init: BiasInit = "zeros",
     ) -> None:
         super().__init__()
-        self.radial = R(input_dim, output_dim=output_dim, hidden_dim=hidden_dim, nonlin=nonlin)
+        self.radial = R(
+            input_dim,
+            output_dim=output_dim,
+            hidden_dim=hidden_dim,
+            nonlin=nonlin,
+            bias_init=bias_init,
+        )
 
     def forward(self, rbf: Tensor, rij: Tensor) -> Tensor:
         # [N, N, output_dim]
@@ -185,9 +250,16 @@ class filter_0(nn.Module):
         output_dim: int = 1,
         hidden_dim: int | None = None,
         nonlin: Callable[[Tensor], Tensor] = F.relu,
+        bias_init: BiasInit = "zeros",
     ) -> None:
         super().__init__()
-        self.filter = F_0(input_dim, output_dim=output_dim, hidden_dim=hidden_dim, nonlin=nonlin)
+        self.filter = F_0(
+            input_dim,
+            output_dim=output_dim,
+            hidden_dim=hidden_dim,
+            nonlin=nonlin,
+            bias_init=bias_init,
+        )
 
     def forward(self, layer_input: Tensor, rbf: Tensor) -> Tensor:
         # [N, N, C, 1]
@@ -211,9 +283,16 @@ class filter_1_output_0(nn.Module):
         output_dim: int = 1,
         hidden_dim: int | None = None,
         nonlin: Callable[[Tensor], Tensor] = F.relu,
+        bias_init: BiasInit = "zeros",
     ) -> None:
         super().__init__()
-        self.filter = F_1(input_dim, output_dim=output_dim, hidden_dim=hidden_dim, nonlin=nonlin)
+        self.filter = F_1(
+            input_dim,
+            output_dim=output_dim,
+            hidden_dim=hidden_dim,
+            nonlin=nonlin,
+            bias_init=bias_init,
+        )
 
     def forward(self, layer_input: Tensor, rbf: Tensor, rij: Tensor) -> Tensor:
         # [N, N, C, 3]
@@ -246,9 +325,16 @@ class filter_1_output_1(nn.Module):
         output_dim: int = 1,
         hidden_dim: int | None = None,
         nonlin: Callable[[Tensor], Tensor] = F.relu,
+        bias_init: BiasInit = "zeros",
     ) -> None:
         super().__init__()
-        self.filter = F_1(input_dim, output_dim=output_dim, hidden_dim=hidden_dim, nonlin=nonlin)
+        self.filter = F_1(
+            input_dim,
+            output_dim=output_dim,
+            hidden_dim=hidden_dim,
+            nonlin=nonlin,
+            bias_init=bias_init,
+        )
 
     def forward(self, layer_input: Tensor, rbf: Tensor, rij: Tensor) -> Tensor:
         # [N, N, C, 3]

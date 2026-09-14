@@ -92,6 +92,105 @@ def test_R_initialises_weights_with_xavier_uniform_not_the_torch_default():
         assert linear.weight.std().item() == pytest.approx(xavier_bound / math.sqrt(3.0), rel=0.05)
 
 
+def test_R_bias_init_zeros_is_explicit_as_well_as_default():
+    """明確傳 "zeros" 與不傳要一樣——實驗一整個吃這個預設。"""
+    radial = layers.R(4, output_dim=3, bias_init="zeros")
+    assert torch.equal(radial.linear1.bias, torch.zeros_like(radial.linear1.bias))
+    assert torch.equal(radial.linear2.bias, torch.zeros_like(radial.linear2.bias))
+
+
+def test_R_glorot_bias_uses_each_biases_own_length():
+    """對齊上游重力 notebook 的 biases_initializer=glorot_uniform。
+
+    TF1 的 _compute_fans 對 1-D 張量取 fan_in = fan_out = shape[0]，界是
+    sqrt(6 / 2n)——所以同一個 R 裡兩顆 bias 的界並不一樣寬。這裡刻意讓
+    hidden_dim 與 output_dim 差很多，才擋得住「用了某個固定的 n」的寫法。
+
+    PyTorch 的 nn.init.xavier_uniform_ 對 1-D 張量直接拋錯，界要自己算。
+    """
+    torch.manual_seed(0)
+    radial = layers.R(4, output_dim=1024, hidden_dim=256, bias_init="glorot")
+
+    for bias in (radial.linear1.bias, radial.linear2.bias):
+        n = bias.shape[0]
+        bound = math.sqrt(6.0 / (n + n))
+        largest = bias.abs().max().item()
+        assert largest <= bound
+        assert largest > 0.9 * bound, "界看起來比 glorot 窄"
+
+    # 分布只在夠長的那顆上驗：n = 1024 時樣本標準差的相對誤差約 2%
+    b2 = radial.linear2.bias
+    bound2 = math.sqrt(6.0 / (2 * b2.shape[0]))
+    assert b2.std().item() == pytest.approx(bound2 / math.sqrt(3.0), rel=0.15)
+
+
+def test_R_glorot_bias_leaves_the_weights_on_xavier():
+    """換掉 bias 的初始化不該連帶動到權重。"""
+    torch.manual_seed(0)
+    dim = 256
+    radial = layers.R(dim, output_dim=dim, bias_init="glorot")
+    xavier_bound = math.sqrt(6.0 / (dim + dim))
+    for linear in (radial.linear1, radial.linear2):
+        assert linear.weight.abs().max().item() <= xavier_bound
+        assert linear.weight.std().item() == pytest.approx(xavier_bound / math.sqrt(3.0), rel=0.05)
+
+
+def test_R_rejects_an_unknown_bias_init():
+    with pytest.raises(ValueError):
+        layers.R(4, bias_init="kaiming")  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize(
+    "cls", [layers.filter_0, layers.filter_1_output_0, layers.filter_1_output_1]
+)
+def test_filter_paths_thread_bias_init_down_to_R(cls):
+    """票 09 的重力實驗要靠這條路把 glorot 一路傳到最底層的 R。
+
+    中間隔了 F_0 / F_1 兩層轉手，少接一段不會報錯、只會靜靜退回全零。
+    """
+    torch.manual_seed(0)
+    path = cls(RBF_COUNT, bias_init="glorot")
+    assert path.filter.radial.linear1.bias.abs().max().item() > 0.0
+
+
+def test_filter_paths_keep_zero_bias_by_default():
+    """實驗一完全吃這個預設，不能因為多了選項就改掉。"""
+    path = layers.filter_0(RBF_COUNT)
+    assert torch.equal(
+        path.filter.radial.linear1.bias, torch.zeros_like(path.filter.radial.linear1.bias)
+    )
+
+
+# --- 徑向探針：把訓練好的 R 攤開成一條曲線 --------------------------------
+
+
+def test_probe_radial_is_the_rbf_expansion_followed_by_R():
+    """探針不是第二套實作，就是「展開再前向」——只是把 RBF 設定收在一處。"""
+    torch.manual_seed(0)
+    radial = layers.R(RBF_COUNT, output_dim=2)
+    distances = torch.linspace(0.1, 3.0, 17)
+    expected = radial(utils.rbf_expansion(distances, low=RBF_LOW, high=RBF_HIGH, count=RBF_COUNT))
+    probed = layers.probe_radial(radial, distances, low=RBF_LOW, high=RBF_HIGH, count=RBF_COUNT)
+    assert torch.allclose(probed, expected)
+
+
+def test_probe_radial_keeps_the_channel_axis():
+    radial = layers.R(RBF_COUNT, output_dim=3)
+    probed = layers.probe_radial(
+        radial, torch.linspace(0.1, 3.0, 11), low=RBF_LOW, high=RBF_HIGH, count=RBF_COUNT
+    )
+    assert probed.shape == (11, 3)
+
+
+def test_probe_radial_does_not_track_gradients():
+    """它是拿來看的，不是訓練路徑的一部分——回傳值要能直接餵給畫圖。"""
+    radial = layers.R(RBF_COUNT)
+    probed = layers.probe_radial(
+        radial, torch.linspace(0.1, 3.0, 5), low=RBF_LOW, high=RBF_HIGH, count=RBF_COUNT
+    )
+    assert not probed.requires_grad
+
+
 # --------------------------------------------------------------------------
 # F_0：L = 0 濾波器
 # --------------------------------------------------------------------------

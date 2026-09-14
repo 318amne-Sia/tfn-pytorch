@@ -313,3 +313,54 @@ def test_rotation_preserves_distances():
     r = torch.randn(6, 3)
     rot = utils.random_rotation_matrix(3)
     assert torch.allclose(utils.distance_matrix(r @ rot.T), utils.distance_matrix(r), atol=1e-5)
+
+
+# --------------------------------------------------------------------------
+# normalized_rmse
+# --------------------------------------------------------------------------
+
+
+def test_normalized_rmse_is_zero_for_an_exact_match():
+    expected = torch.tensor([1.0, -2.0, 3.5])
+    assert utils.normalized_rmse(expected.clone(), expected).item() == 0.0
+
+
+def test_normalized_rmse_matches_a_hand_computation():
+    expected = torch.tensor([3.0, 4.0])  # 均方 12.5
+    actual = torch.tensor([3.0, 5.0])  # 差是 [0, 1]，均方 0.5
+    assert utils.normalized_rmse(actual, expected).item() == pytest.approx(
+        math.sqrt(0.5) / math.sqrt(12.5)
+    )
+
+
+def test_normalized_rmse_is_invariant_to_a_common_rescale():
+    """兩邊一起放大不改變比值。
+
+    這是選比值而不選絕對 RMSE 的理由：三條待驗收的曲線量級差很多
+    （2/3·r² 在 1 以下、−1/r² 可以到 −4），用比值才能共用同一種門檻寫法。
+    """
+    expected = torch.tensor([1.0, -2.0, 3.5])
+    actual = torch.tensor([1.1, -1.8, 3.9])
+    base = utils.normalized_rmse(actual, expected).item()
+    assert utils.normalized_rmse(actual * 7.0, expected * 7.0).item() == pytest.approx(base)
+
+
+def test_normalized_rmse_is_two_for_a_sign_flip():
+    """整條曲線取負剛好得到 2.0。
+
+    CG 係數或 Levi-Civita 符號弄反時，曲線形狀會完全正確、只差一個負號，
+    而 loss 照樣降得下去。這條釘死「任何合理的門檻都擋得住符號反轉」。
+    """
+    expected = torch.tensor([1.0, -2.0, 3.5])
+    assert utils.normalized_rmse(-expected, expected).item() == pytest.approx(2.0)
+
+
+def test_normalized_rmse_rejects_an_all_zero_reference():
+    """分母是 0 時寧可吵，也不要靜靜回傳 inf 或 nan。"""
+    with pytest.raises(ValueError):
+        utils.normalized_rmse(torch.ones(3), torch.zeros(3))
+
+
+def test_normalized_rmse_rejects_mismatched_shapes():
+    with pytest.raises(ValueError):
+        utils.normalized_rmse(torch.ones(3), torch.ones(4))
