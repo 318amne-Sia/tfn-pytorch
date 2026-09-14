@@ -43,7 +43,7 @@ dev = [
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 # 預設會跑；要跳過最花時間的那兩條用 `uv run pytest -m "not slow"`
-markers = ["slow: 需要訓練到收斂，整組約 11 秒"]
+markers = ["slow: 需要訓練到收斂，整組約 15 秒"]
 # 打錯的 marker 只會發 warning，然後靜靜地不被 -m 篩選到；strict 讓它直接失敗
 addopts = "--strict-markers"
 

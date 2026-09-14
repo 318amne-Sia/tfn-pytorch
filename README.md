@@ -12,7 +12,7 @@ TF 1.15 最高只支援 Python 3.7，macOS arm64 根本沒有 wheel，Colab 也�
 | --- | --- | --- |
 | shape classification（3D Tetris） | §5.1 | 完成——測試準確率 100% |
 | Newtonian gravity | §5.2 | 完成——徑向函數對 `−1/r²` 的 nRMSE 0.099 |
-| moment of inertia | §5.2 | 進行中 |
+| moment of inertia | §5.2 | 完成——兩條徑向函數對 `2/3·r²` 與 `−r²` 的 nRMSE 0.028 / 0.011 |
 | missing point（QM9） | §5.3 | 未開始 |
 
 ## 在 Colab 上用
@@ -46,7 +46,7 @@ Colab 的 pip 安裝不持久，換一台 VM 就沒了，所以這格每個 sess
 ```sh
 uv sync                        # 建 Python 3.12 環境（對齊 Colab 的 3.12.13）並安裝
 uv run pytest                  # 測試
-uv run pytest -m "not slow"    # 跳過訓練到收斂的那幾條（13 秒 -> 2 秒）
+uv run pytest -m "not slow"    # 跳過訓練到收斂的那幾條（17 秒 -> 2 秒）
 uv run ruff check .            # lint
 uv run ruff format .           # 格式化
 uv run pyright                 # 型別檢查
